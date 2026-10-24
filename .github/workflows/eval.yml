@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests
+        run: go test ./... -count=1
+
+      # The quality gate. The eval package test fails the build when the
+      # golden-set pass rate or latency budget regresses. This is what makes
+      # the repo more than a demo — quality is enforced in CI.
+      - name: Eval gate
+        run: go test ./internal/eval/... -run TestGoldenSet -v -count=1

@@ -1,0 +1,18 @@
+# Binaries
+/llmgate
+/bin/
+*.exe
+
+# Env & secrets
+.env
+config.yaml
+
+# Go
+*.test
+*.out
+coverage.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

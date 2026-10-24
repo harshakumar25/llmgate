@@ -1,0 +1,36 @@
+# docker compose up  → gateway + Postgres + Redis.
+# The gateway runs today with the in-memory meter/cache; Postgres and Redis are
+# here and ready for when you wire metering.NewPostgres and cache.NewRedis.
+services:
+  llmgate:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      LLMGATE_ADDR: ":8080"
+      DATABASE_URL: "postgres://llmgate:llmgate@postgres:5432/llmgate?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      # Point at host Ollama by default; set OPENAI_API_KEY to enable OpenAI.
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: llmgate
+      POSTGRES_PASSWORD: llmgate
+      POSTGRES_DB: llmgate
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:

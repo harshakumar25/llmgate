@@ -1,0 +1,17 @@
+[
+  {
+    "name": "capital-france",
+    "messages": [{"role": "user", "content": "What is the capital of France? Answer in one word."}],
+    "expect_contains": ["paris"]
+  },
+  {
+    "name": "arithmetic",
+    "messages": [{"role": "user", "content": "What is 7 multiplied by 6? Reply with just the number."}],
+    "expect_contains": ["42"]
+  },
+  {
+    "name": "json-keyword",
+    "messages": [{"role": "user", "content": "Name the data format that uses curly braces and key-value pairs, commonly used in web APIs."}],
+    "expect_contains": ["json"]
+  }
+]

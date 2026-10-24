@@ -1,0 +1,29 @@
+# LLMGate configuration. Copy to config.yaml and edit.
+# Run with: LLMGATE_CONFIG=config.yaml go run ./cmd/llmgate
+
+addr: ":8080"
+
+# Providers are tried in order. The router fails over to the next one on error.
+providers:
+  - name: openai
+    base_url: https://api.openai.com
+    api_key: ${OPENAI_API_KEY}   # expanded from the environment
+    model: gpt-4o-mini
+  - name: ollama
+    base_url: http://localhost:11434
+    model: llama3.2
+
+# Failover / retry.
+max_attempts: 2
+backoff_ms: 200
+
+# Security guardrails (LLMGate's differentiator).
+block_prompt_injection: true
+redact_pii: true
+
+# Comma-separated API keys. Leave empty to run open (local dev only).
+api_keys: ""
+
+# Optional backends (seams are wired; drivers are TODO).
+# database: postgres://llmgate:llmgate@localhost:5432/llmgate?sslmode=disable
+# redis: localhost:6379
