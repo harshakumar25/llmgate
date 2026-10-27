@@ -35,11 +35,29 @@ func (o *Ollama) Chat(ctx context.Context, req Request) (*Response, error) {
 	if model == "" {
 		model = o.model
 	}
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model":    model,
 		"messages": req.Messages,
 		"stream":   false,
-	})
+	}
+	// Ollama takes sampling settings under "options".
+	opts := map[string]any{}
+	if req.Temperature != 0 {
+		opts["temperature"] = req.Temperature
+	}
+	if req.MaxTokens > 0 {
+		opts["num_predict"] = req.MaxTokens
+	}
+	if len(opts) > 0 {
+		payload["options"] = opts
+	}
+	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" {
+		payload["format"] = "json"
+	}
+	if req.Think != nil {
+		payload["think"] = *req.Think
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}

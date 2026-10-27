@@ -16,6 +16,7 @@ import (
 type Config struct {
 	Addr       string
 	Providers  []Provider
+	Timeout    time.Duration // per upstream call; slow local models need more
 	Retry      Retry
 	Guardrails Guardrails
 	Database   string // DSN, e.g. postgres://... (used once you wire metering.NewPostgres)
@@ -50,6 +51,7 @@ func Default() *Config {
 		Providers: []Provider{
 			{Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.2"},
 		},
+		Timeout:    60 * time.Second,
 		Retry:      Retry{MaxAttempts: 2, Backoff: 200 * time.Millisecond},
 		Guardrails: Guardrails{BlockPromptInjection: true, RedactPII: true},
 	}
@@ -94,6 +96,11 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("REDIS_ADDR"); v != "" {
 		c.Redis = v
+	}
+	if v := os.Getenv("LLMGATE_UPSTREAM_TIMEOUT_S"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.Timeout = time.Duration(n) * time.Second
+		}
 	}
 	if v := os.Getenv("LLMGATE_API_KEYS"); v != "" {
 		c.APIKeys = splitAndTrim(v, ",")
@@ -178,6 +185,10 @@ func applyTopLevel(c *Config, key, val string) {
 		c.Redis = val
 	case "api_keys":
 		c.APIKeys = splitAndTrim(val, ",")
+	case "upstream_timeout_s":
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			c.Timeout = time.Duration(n) * time.Second
+		}
 	case "max_attempts":
 		if n, err := strconv.Atoi(val); err == nil {
 			c.Retry.MaxAttempts = n

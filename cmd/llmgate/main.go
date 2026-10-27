@@ -32,7 +32,7 @@ func main() {
 
 	// Build the provider chain in the configured order. Providers are tried
 	// in order by the router until one succeeds.
-	chain, err := providers.Build(cfg.Providers)
+	chain, err := providers.Build(cfg.Providers, cfg.Timeout)
 	if err != nil {
 		logger.Error("build providers", "err", err)
 		os.Exit(1)

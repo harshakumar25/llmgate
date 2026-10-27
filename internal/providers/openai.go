@@ -35,12 +35,19 @@ func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
 	if model == "" {
 		model = o.model
 	}
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model":       model,
 		"messages":    req.Messages,
 		"temperature": req.Temperature,
-		"max_tokens":  req.MaxTokens,
-	})
+	}
+	// OpenAI rejects max_tokens: 0, so only send it when set.
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
+	}
+	if req.ResponseFormat != nil {
+		payload["response_format"] = req.ResponseFormat
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}

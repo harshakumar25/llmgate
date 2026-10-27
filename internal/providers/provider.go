@@ -24,6 +24,17 @@ type Request struct {
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature,omitempty"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
+	// ResponseFormat requests structured output, OpenAI-style
+	// ({"type": "json_object"}). Ollama maps it to format: "json".
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+	// Think toggles reasoning on models that support it (Ollama's "think").
+	// Nil leaves the model's default; providers without the knob ignore it.
+	Think *bool `json:"think,omitempty"`
+}
+
+// ResponseFormat is OpenAI's response_format field.
+type ResponseFormat struct {
+	Type string `json:"type"`
 }
 
 // Usage reports token accounting for a single call.
@@ -50,9 +61,13 @@ type Provider interface {
 	Chat(ctx context.Context, req Request) (*Response, error)
 }
 
-// Build constructs the ordered provider chain from config.
-func Build(cfgs []config.Provider) ([]Provider, error) {
-	httpClient := &http.Client{Timeout: 60 * time.Second}
+// Build constructs the ordered provider chain from config. timeout bounds each
+// upstream call; zero means 60s.
+func Build(cfgs []config.Provider, timeout time.Duration) ([]Provider, error) {
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	httpClient := &http.Client{Timeout: timeout}
 	out := make([]Provider, 0, len(cfgs))
 	for _, c := range cfgs {
 		switch c.Name {

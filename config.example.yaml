@@ -13,6 +13,9 @@ providers:
     base_url: http://localhost:11434
     model: llama3.2
 
+# Per upstream call. Raise it for slow local models (e.g. reasoning models on CPU).
+upstream_timeout_s: 60
+
 # Failover / retry.
 max_attempts: 2
 backoff_ms: 200
