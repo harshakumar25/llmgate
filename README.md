@@ -92,7 +92,17 @@ Request body:
 { "model": "gpt-4o-mini", "messages": [{"role":"user","content":"..."}], "temperature": 0.2 }
 ```
 
-Set `api_keys` in config to require `Authorization: Bearer <key>`.
+Optional fields, forwarded in each provider's own format:
+
+| Field | Effect |
+|---|---|
+| `max_tokens` | Output cap (`num_predict` on Ollama) |
+| `response_format` | `{"type": "json_object"}` for JSON mode (`format: "json"` on Ollama) |
+| `think` | `true` / `false` reasoning toggle for models that support it (Ollama) |
+
+Set `api_keys` in config to require `Authorization: Bearer <key>`. Slow local
+models may need a longer `upstream_timeout_s` (default 60, or
+`LLMGATE_UPSTREAM_TIMEOUT_S`).
 
 ## The eval gate
 
@@ -119,6 +129,14 @@ LLMGate filters requests *before* they reach a model:
 
 These are a foundation, not a finished product. Roadmap: a classifier-based
 injection detector, per-tenant policy, output-side scanning, and audit logging.
+
+## Experiments
+
+- [Winner's curse in automated retrieval search](experiments/winners-curse/):
+  an LLM-driven search through LLMGate claimed +4.5 points of Recall@10 on a
+  100-query eval. On 1,009 held-out queries the real gain was +1.5. Includes a
+  1,000-config sweep of how that optimism scales with the number of candidates
+  and the eval size, and the three gateway bugs the run exposed.
 
 ## Roadmap
 
@@ -157,4 +175,4 @@ make up         # docker compose stack
 
 ## License
 
-MIT © Harsha Kumar
+MIT © Harsh Kumar
