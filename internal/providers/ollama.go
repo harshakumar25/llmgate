@@ -29,15 +29,24 @@ func NewOllama(c config.Provider, client *http.Client) *Ollama {
 func (o *Ollama) Name() string { return "ollama" }
 
 // payload builds the /api/chat body shared by Chat and ChatStream.
-func (o *Ollama) payload(req Request) (string, map[string]any) {
+func (o *Ollama) payload(req Request) (string, map[string]any, error) {
 	model := req.Model
 	if model == "" {
 		model = o.model
 	}
+	msgs, err := ollamaMessages(req.Messages)
+	if err != nil {
+		return "", nil, err
+	}
 	p := map[string]any{
 		"model":    model,
-		"messages": req.Messages,
+		"messages": msgs,
 		"stream":   false,
+	}
+	// Ollama takes OpenAI-shaped tools but has no tool_choice: "none" is
+	// honoured by not offering the tools; "required" cannot be enforced.
+	if mode, _ := toolChoiceMode(req.ToolChoice); len(req.Tools) > 0 && mode != "none" {
+		p["tools"] = req.Tools
 	}
 	// Ollama takes sampling settings under "options".
 	opts := map[string]any{}
@@ -56,7 +65,7 @@ func (o *Ollama) payload(req Request) (string, map[string]any) {
 	if req.Think != nil {
 		p["think"] = *req.Think
 	}
-	return model, p
+	return model, p, nil
 }
 
 func (o *Ollama) post(ctx context.Context, payload map[string]any) (*http.Response, error) {
@@ -64,7 +73,10 @@ func (o *Ollama) post(ctx context.Context, payload map[string]any) (*http.Respon
 }
 
 func (o *Ollama) Chat(ctx context.Context, req Request) (*Response, error) {
-	model, payload := o.payload(req)
+	model, payload, err := o.payload(req)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := o.post(ctx, payload)
 	if err != nil {
 		return nil, err
@@ -72,18 +84,39 @@ func (o *Ollama) Chat(ctx context.Context, req Request) (*Response, error) {
 	defer resp.Body.Close()
 
 	var parsed struct {
-		Message         Message `json:"message"`
-		PromptEvalCount int     `json:"prompt_eval_count"`
-		EvalCount       int     `json:"eval_count"`
+		Message struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+		DoneReason      string `json:"done_reason"`
+		PromptEvalCount int    `json:"prompt_eval_count"`
+		EvalCount       int    `json:"eval_count"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return nil, fmt.Errorf("ollama: decode: %w", err)
 	}
 
+	var calls []ToolCall
+	for _, c := range parsed.Message.ToolCalls {
+		id := c.ID
+		if id == "" {
+			id = newCallID()
+		}
+		calls = append(calls, ToolCall{ID: id, Type: "function",
+			Function: ToolCallFunction{Name: c.Function.Name, Arguments: argsString(c.Function.Arguments)}})
+	}
 	return &Response{
-		Content:  parsed.Message.Content,
-		Model:    model,
-		Provider: o.Name(),
-		Usage:    usage(parsed.PromptEvalCount, parsed.EvalCount),
+		Content:      parsed.Message.Content,
+		ToolCalls:    calls,
+		FinishReason: finishFrom(parsed.DoneReason, len(calls)),
+		Model:        model,
+		Provider:     o.Name(),
+		Usage:        usage(parsed.PromptEvalCount, parsed.EvalCount),
 	}, nil
 }

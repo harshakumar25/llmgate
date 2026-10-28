@@ -169,7 +169,11 @@ func (r *Router) RouteStream(ctx context.Context, req providers.Request, onDelta
 		return nil, err
 	}
 	return r.run(ctx, plan, func(p providers.Provider, req providers.Request) (*providers.Response, error) {
-		if s, ok := p.(providers.Streamer); ok {
+		// Tool calls arrive as fragments of JSON arguments spread over many
+		// events, in a different framing per provider. Requests with tools
+		// are made unstreamed and delivered whole, which every provider and
+		// client handles the same way.
+		if s, ok := p.(providers.Streamer); ok && len(req.Tools) == 0 {
 			return s.ChatStream(ctx, req, deliver)
 		}
 		resp, err := p.Chat(ctx, req)

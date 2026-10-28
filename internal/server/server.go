@@ -30,6 +30,7 @@ type Deps struct {
 	Config     *config.Config
 	Router     *router.Router
 	Guardrails *guardrails.Guardrails
+	Classifier *guardrails.Classifier // nil when the model-based check is off
 	Meter      metering.Meter
 	Prices     *metering.Prices // nil prices with the built-in table only
 	Cache      cache.Cache

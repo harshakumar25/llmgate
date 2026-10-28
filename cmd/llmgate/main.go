@@ -49,10 +49,27 @@ func main() {
 		served[i] = p.Serves()
 	}
 
+	var classifier *guardrails.Classifier
+	if g := cfg.Guardrails.Classifier; g.Provider != "" {
+		pc, _ := cfg.Provider(g.Provider)
+		guard, err := providers.Build([]config.Provider{pc}, cfg.Timeout)
+		if err != nil {
+			logger.Error("build guard provider", "err", err)
+			os.Exit(1)
+		}
+		model := g.Model
+		if model == "" {
+			model = pc.Model
+		}
+		classifier = guardrails.NewClassifier(guard[0], model, g.Timeout, g.FailClosed)
+		logger.Info("injection classifier on", "provider", pc.Name, "model", model, "flag_only", g.FlagOnly, "fail_closed", g.FailClosed)
+	}
+
 	srv := server.New(server.Deps{
 		Config:     cfg,
 		Router:     router.NewWithModels(chain, served, cfg.Retry, cfg.ModelFallback),
 		Guardrails: guardrails.New(cfg.Guardrails),
+		Classifier: classifier,
 		Meter:      meter,
 		Prices:     metering.NewPrices(cfg.Providers),
 		Cache:      cache.NewRedis(cfg.Redis, cfg.Cache.MaxEntries), // in-memory when redis is unset

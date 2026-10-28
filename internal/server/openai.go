@@ -33,7 +33,8 @@ type oaiRequest struct {
 	} `json:"stream_options"`
 	ResponseFormat *providers.ResponseFormat `json:"response_format"`
 	N              *int                      `json:"n"`
-	Tools          json.RawMessage           `json:"tools"`
+	Tools          []providers.Tool          `json:"tools"`
+	ToolChoice     json.RawMessage           `json:"tool_choice"`
 	// Think is LLMGate's reasoning toggle (Ollama), accepted here too since
 	// OpenAI's request has no equivalent. SDKs send it via extra_body.
 	Think *bool `json:"think"`
@@ -41,8 +42,10 @@ type oaiRequest struct {
 
 // oaiMessage.Content is either a string or an array of content parts.
 type oaiMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string               `json:"role"`
+	Content    json.RawMessage      `json:"content"`
+	ToolCalls  []providers.ToolCall `json:"tool_calls"`
+	ToolCallID string               `json:"tool_call_id"`
 }
 
 // text flattens a message's content to plain text. Text parts are joined;
@@ -83,9 +86,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeErrorParam(w, http.StatusBadRequest, "n", "only n=1 is supported")
 		return
 	}
-	if len(bytes.TrimSpace(in.Tools)) > 0 && string(bytes.TrimSpace(in.Tools)) != "null" {
-		writeErrorParam(w, http.StatusBadRequest, "tools", "tool calling is not supported by this gateway yet")
-		return
+	for i, t := range in.Tools {
+		if t.Type != "function" || t.Function.Name == "" {
+			writeErrorParam(w, http.StatusBadRequest, fmt.Sprintf("tools[%d]", i), `only {"type":"function"} tools with a name are supported`)
+			return
+		}
 	}
 	req := providers.Request{
 		Model:          in.Model,
@@ -93,6 +98,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ResponseFormat: in.ResponseFormat,
 		Stream:         in.Stream,
 		Think:          in.Think,
+		Tools:          in.Tools,
+	}
+	if len(in.Tools) > 0 && len(bytes.TrimSpace(in.ToolChoice)) > 0 && string(bytes.TrimSpace(in.ToolChoice)) != "null" {
+		req.ToolChoice = in.ToolChoice
 	}
 	if in.MaxCompletionTokens > 0 {
 		req.MaxTokens = in.MaxCompletionTokens
@@ -106,7 +115,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeErrorParam(w, http.StatusBadRequest, fmt.Sprintf("messages[%d].content", i), err.Error())
 			return
 		}
-		req.Messages = append(req.Messages, providers.Message{Role: m.Role, Content: text})
+		req.Messages = append(req.Messages, providers.Message{
+			Role: m.Role, Content: text, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID,
+		})
 	}
 	f := openaiFormat{
 		id:           "chatcmpl-" + requestID(r),
@@ -131,8 +142,27 @@ type oaiChoice struct {
 }
 
 type oaiOutMessage struct {
-	Role    string  `json:"role,omitempty"`
-	Content *string `json:"content,omitempty"`
+	Role      string        `json:"role,omitempty"`
+	Content   *string       `json:"content,omitempty"`
+	ToolCalls []oaiToolCall `json:"tool_calls,omitempty"`
+}
+
+// oaiToolCall is a tool call as it appears in a reply. In stream chunks it
+// also carries its position, since clients assemble calls by index.
+type oaiToolCall struct {
+	Index *int `json:"index,omitempty"`
+	providers.ToolCall
+}
+
+func toOAICalls(calls []providers.ToolCall, indexed bool) []oaiToolCall {
+	out := make([]oaiToolCall, len(calls))
+	for i, c := range calls {
+		out[i] = oaiToolCall{ToolCall: c}
+		if indexed {
+			out[i].Index = &i
+		}
+	}
+	return out
 }
 
 type oaiCompletion struct {
@@ -147,18 +177,29 @@ type oaiCompletion struct {
 
 var jsonNull = json.RawMessage("null")
 
-// finishReason reports "length" when the reply used the whole token
-// allowance, which is how a cut-off answer shows up across providers.
+// finishReason is the provider's own reason when it gave one. Otherwise it
+// is "tool_calls" for a tool call, "length" when the reply used the whole
+// token allowance, and "stop" for the rest.
 func finishReason(req providers.Request, resp *providers.Response) *string {
-	r := "stop"
-	if req.MaxTokens > 0 && resp.Usage.CompletionTokens >= req.MaxTokens {
+	r := resp.FinishReason
+	switch {
+	case len(resp.ToolCalls) > 0:
+		r = "tool_calls"
+	case r != "":
+	case req.MaxTokens > 0 && resp.Usage.CompletionTokens >= req.MaxTokens:
 		r = "length"
+	default:
+		r = "stop"
 	}
 	return &r
 }
 
 func (f openaiFormat) reply(w http.ResponseWriter, req providers.Request, resp *providers.Response) {
-	content := resp.Content
+	msg := &oaiOutMessage{Role: "assistant", ToolCalls: toOAICalls(resp.ToolCalls, false)}
+	// OpenAI sends content: null on a pure tool call; keep text otherwise.
+	if content := resp.Content; content != "" || len(resp.ToolCalls) == 0 {
+		msg.Content = &content
+	}
 	w.Header().Set("X-LLMGate-Provider", resp.Provider)
 	usage := resp.Usage
 	writeJSON(w, http.StatusOK, oaiCompletion{
@@ -167,7 +208,7 @@ func (f openaiFormat) reply(w http.ResponseWriter, req providers.Request, resp *
 		Created: f.created,
 		Model:   resp.Model,
 		Choices: []oaiChoice{{
-			Message:      &oaiOutMessage{Role: "assistant", Content: &content},
+			Message:      msg,
 			FinishReason: finishReason(req, resp),
 			Logprobs:     jsonNull,
 		}},
@@ -212,6 +253,9 @@ func (o *openaiStream) done(resp *providers.Response) {
 	if !o.sse.started {
 		empty := ""
 		_ = o.chunk(resp.Model, []oaiChoice{{Delta: &oaiOutMessage{Role: "assistant", Content: &empty}, Logprobs: jsonNull}}, nil)
+	}
+	if len(resp.ToolCalls) > 0 {
+		_ = o.chunk(resp.Model, []oaiChoice{{Delta: &oaiOutMessage{ToolCalls: toOAICalls(resp.ToolCalls, true)}, Logprobs: jsonNull}}, nil)
 	}
 	_ = o.chunk(resp.Model, []oaiChoice{{Delta: &oaiOutMessage{}, FinishReason: finishReason(o.req, resp), Logprobs: jsonNull}}, nil)
 	if o.f.includeUsage {

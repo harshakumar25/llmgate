@@ -37,7 +37,7 @@ type Config struct {
 
 // Provider describes one upstream model backend.
 type Provider struct {
-	Name    string // "openai" | "ollama" | "anthropic"
+	Name    string // "openai" | "ollama" | "anthropic" | "gemini"
 	BaseURL string
 	APIKey  string // may reference ${ENV_VAR}
 	Model   string
@@ -47,6 +47,16 @@ type Provider struct {
 	Models []string
 	// Price in USD per million tokens, overriding the built-in table.
 	PriceIn, PriceOut float64
+}
+
+// Provider returns the first configured provider with this name.
+func (c *Config) Provider(name string) (Provider, bool) {
+	for _, p := range c.Providers {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return Provider{}, false
 }
 
 // Serves returns every model name this provider accepts as-is.
@@ -90,6 +100,19 @@ type Guardrails struct {
 	BlockPromptInjection bool
 	RedactPII            bool
 	RedactOutput         bool // also scrub PII from non-streamed replies
+
+	// Classifier: a model asked whether each new prompt is an injection
+	// attempt, after the regex patterns pass. Off unless Provider is set.
+	Classifier Classifier
+}
+
+// Classifier configures the model-based injection check.
+type Classifier struct {
+	Provider   string        // name of a configured provider, e.g. "ollama"
+	Model      string        // defaults to that provider's model
+	Timeout    time.Duration // default 5s
+	FailClosed bool          // block when the classifier errors (default: allow)
+	FlagOnly   bool          // only label (X-LLMGate-Guard: flagged), never block
 }
 
 // Default returns a config that runs out of the box against a local Ollama.
@@ -136,6 +159,11 @@ func (c *Config) validate() error {
 	for i, p := range c.Providers {
 		if p.Name == "" || p.Model == "" {
 			return fmt.Errorf("config: provider %d missing name or model", i)
+		}
+	}
+	if g := c.Guardrails.Classifier.Provider; g != "" {
+		if _, ok := c.Provider(g); !ok {
+			return fmt.Errorf("config: guard_provider %q is not a configured provider", g)
 		}
 	}
 	return nil
@@ -305,6 +333,18 @@ func applyTopLevel(c *Config, key, val string) {
 		c.Guardrails.RedactPII = val == "true"
 	case "redact_output":
 		c.Guardrails.RedactOutput = val == "true"
+	case "guard_provider":
+		c.Guardrails.Classifier.Provider = val
+	case "guard_model":
+		c.Guardrails.Classifier.Model = val
+	case "guard_timeout_ms":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.Guardrails.Classifier.Timeout = time.Duration(n) * time.Millisecond
+		}
+	case "guard_fail_closed":
+		c.Guardrails.Classifier.FailClosed = val == "true"
+	case "guard_mode":
+		c.Guardrails.Classifier.FlagOnly = val == "flag"
 	}
 }
 

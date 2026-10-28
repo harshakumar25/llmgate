@@ -46,13 +46,17 @@ func (a *Anthropic) payload(req Request, stream bool) (string, []byte, error) {
 		model = a.model
 	}
 	var system []string
-	msgs := make([]Message, 0, len(req.Messages))
+	turns := make([]Message, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		if m.Role == "system" {
 			system = append(system, m.Content)
 			continue
 		}
-		msgs = append(msgs, m)
+		turns = append(turns, m)
+	}
+	msgs, err := anthropicMessages(turns)
+	if err != nil {
+		return "", nil, err
 	}
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
@@ -68,6 +72,12 @@ func (a *Anthropic) payload(req Request, stream bool) (string, []byte, error) {
 	}
 	if req.Temperature != 0 {
 		p["temperature"] = req.Temperature
+	}
+	if tools, choice := anthropicTools(req); tools != nil {
+		p["tools"] = tools
+		if choice != nil {
+			p["tool_choice"] = choice
+		}
 	}
 	if stream {
 		p["stream"] = true
@@ -111,10 +121,14 @@ func (a *Anthropic) Chat(ctx context.Context, req Request) (*Response, error) {
 
 	var parsed struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type  string          `json:"type"`
+			Text  string          `json:"text"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
 		} `json:"content"`
-		Usage struct {
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
 			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
@@ -123,16 +137,23 @@ func (a *Anthropic) Chat(ctx context.Context, req Request) (*Response, error) {
 		return nil, fmt.Errorf("anthropic: decode: %w", err)
 	}
 	var text strings.Builder
+	var calls []ToolCall
 	for _, c := range parsed.Content {
-		if c.Type == "text" {
+		switch c.Type {
+		case "text":
 			text.WriteString(c.Text)
+		case "tool_use":
+			calls = append(calls, ToolCall{ID: c.ID, Type: "function",
+				Function: ToolCallFunction{Name: c.Name, Arguments: argsString(c.Input)}})
 		}
 	}
 	return &Response{
-		Content:  text.String(),
-		Model:    model,
-		Provider: a.Name(),
-		Usage:    usage(parsed.Usage.InputTokens, parsed.Usage.OutputTokens),
+		Content:      text.String(),
+		ToolCalls:    calls,
+		FinishReason: finishFrom(parsed.StopReason, len(calls)),
+		Model:        model,
+		Provider:     a.Name(),
+		Usage:        usage(parsed.Usage.InputTokens, parsed.Usage.OutputTokens),
 	}, nil
 }
 

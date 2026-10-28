@@ -46,6 +46,13 @@ func (o *OpenAI) payload(req Request) (string, map[string]any) {
 	if req.ResponseFormat != nil {
 		p["response_format"] = req.ResponseFormat
 	}
+	// Tools, tool_choice and tool turns are already in OpenAI's shape.
+	if len(req.Tools) > 0 {
+		p["tools"] = req.Tools
+		if len(req.ToolChoice) > 0 {
+			p["tool_choice"] = req.ToolChoice
+		}
+	}
 	return model, p
 }
 
@@ -63,7 +70,8 @@ func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
 
 	var parsed struct {
 		Choices []struct {
-			Message Message `json:"message"`
+			Message      Message `json:"message"`
+			FinishReason string  `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -77,11 +85,14 @@ func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
 		return nil, fmt.Errorf("openai: no choices returned")
 	}
 
+	c := parsed.Choices[0]
 	return &Response{
-		Content:  parsed.Choices[0].Message.Content,
-		Model:    model,
-		Provider: o.Name(),
-		Usage:    usage(parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens),
+		Content:      c.Message.Content,
+		ToolCalls:    c.Message.ToolCalls,
+		FinishReason: c.FinishReason,
+		Model:        model,
+		Provider:     o.Name(),
+		Usage:        usage(parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens),
 	}, nil
 }
 

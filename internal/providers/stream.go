@@ -111,7 +111,10 @@ func (o *OpenAI) ChatStream(ctx context.Context, req Request, onDelta func(strin
 // ChatStream streams from Ollama, which sends newline-delimited JSON objects
 // and reports token counts on the final one (done: true).
 func (o *Ollama) ChatStream(ctx context.Context, req Request, onDelta func(string) error) (*Response, error) {
-	model, payload := o.payload(req)
+	model, payload, err := o.payload(req)
+	if err != nil {
+		return nil, err
+	}
 	payload["stream"] = true
 	resp, err := o.post(ctx, payload)
 	if err != nil {

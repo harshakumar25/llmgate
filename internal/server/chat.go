@@ -67,6 +67,10 @@ func (s *Server) serveChat(w http.ResponseWriter, r *http.Request, req providers
 		writeError(w, http.StatusBadRequest, "messages must not be empty")
 		return
 	}
+	if err := providers.ValidateMessages(req.Messages); err != nil {
+		writeErrorParam(w, http.StatusBadRequest, "messages", err.Error())
+		return
+	}
 
 	// 1. Guardrails: block injection, redact PII in place.
 	if res := s.deps.Guardrails.Apply(&req); res.Blocked {
@@ -99,6 +103,12 @@ func (s *Server) serveChat(w http.ResponseWriter, r *http.Request, req providers
 	apiKey := bearerToken(r)
 	if msg := s.overBudget(apiKey); msg != "" {
 		writeErrorCode(w, http.StatusTooManyRequests, "insufficient_quota", msg)
+		return
+	}
+
+	// 4. Classifier: a model judges new prompts the regexes let through.
+	// Cache hits skip it: a cached prompt already passed when it was new.
+	if !s.classify(w, r, req, apiKey) {
 		return
 	}
 
@@ -176,6 +186,37 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req provider
 		s.deps.Cache.Set(key, s.redactOutput(resp), s.cacheTTL)
 	}
 	sw.done(resp)
+}
+
+// classify runs the model-based injection check and reports whether the
+// request may continue. Its verdict is labelled in X-LLMGate-Guard; its own
+// tokens are metered to the caller like any other call.
+func (s *Server) classify(w http.ResponseWriter, r *http.Request, req providers.Request, apiKey string) bool {
+	c := s.deps.Classifier
+	if c == nil {
+		return true
+	}
+	v, usage, err := c.Check(r.Context(), req)
+	if usage != nil {
+		s.meter(apiKey, usage)
+	}
+	if err != nil {
+		s.deps.Logger.Warn("guard classifier failed", "id", requestID(r), "err", err)
+	}
+	switch {
+	case !v.Injection && err != nil:
+		w.Header().Set("X-LLMGate-Guard", "error")
+	case !v.Injection:
+		w.Header().Set("X-LLMGate-Guard", "pass")
+	case s.deps.Config.Guardrails.Classifier.FlagOnly:
+		w.Header().Set("X-LLMGate-Guard", "flagged")
+		s.deps.Logger.Warn("guard classifier flagged a prompt", "id", requestID(r), "reason", v.Reason)
+	default:
+		w.Header().Set("X-LLMGate-Guard", "blocked")
+		writeErrorCode(w, http.StatusForbidden, "prompt_injection", "request blocked by prompt-injection classifier: "+v.Reason)
+		return false
+	}
+	return true
 }
 
 func (s *Server) meter(apiKey string, resp *providers.Response) {
@@ -257,12 +298,19 @@ func (n *nativeStream) delta(text string) error {
 }
 
 func (n *nativeStream) done(resp *providers.Response) {
-	_ = n.sse.event(map[string]any{
+	ev := map[string]any{
 		"done":     true,
 		"model":    resp.Model,
 		"provider": resp.Provider,
 		"usage":    resp.Usage,
-	})
+	}
+	if len(resp.ToolCalls) > 0 {
+		ev["tool_calls"] = resp.ToolCalls
+	}
+	if resp.FinishReason != "" {
+		ev["finish_reason"] = resp.FinishReason
+	}
+	_ = n.sse.event(ev)
 	n.sse.finish()
 }
 

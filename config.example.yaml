@@ -10,6 +10,9 @@ providers:
     api_key: ${OPENAI_API_KEY}   # expanded from the environment
     model: gpt-4o-mini
     models: gpt-4o               # other names passed through as-is
+  - name: gemini
+    api_key: ${GEMINI_API_KEY}
+    model: gemini-2.5-flash
   - name: anthropic
     api_key: ${ANTHROPIC_API_KEY}
     model: claude-haiku-5-5
@@ -48,6 +51,14 @@ cache_ttl_s: 300
 block_prompt_injection: true
 redact_pii: true
 redact_output: false   # also scrub PII from replies (not from live stream fragments)
+
+# Model-based injection classifier, run after the regex patterns on prompts
+# that are not cached. Uses one of the providers above, called directly.
+# guard_provider: ollama
+# guard_model: qwen3:4b      # default: that provider's model
+# guard_mode: block          # or "flag": label X-LLMGate-Guard, never block
+# guard_fail_closed: false   # true = block when the classifier errors
+# guard_timeout_ms: 5000
 
 # Per-key rate limit (API key, or client IP when api_keys is empty). 0 = off.
 rate_limit_rpm: 0

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/harshakumar25/llmgate/internal/guardrails"
 	"github.com/harshakumar25/llmgate/internal/router"
 )
 
@@ -61,6 +62,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metric("llmgate_rate_limited_total", "counter", "Requests rejected with 429 by the per-key rate limit.", limited)
 	metric("llmgate_coalesced_total", "counter", "Requests that shared an identical in-flight upstream call.", shared)
 	metric("llmgate_upstream_flights_total", "counter", "Coalescing groups that made an upstream call.", leaders)
+
+	var gs guardrails.ClassifierStats
+	if s.deps.Classifier != nil {
+		gs = s.deps.Classifier.Stats()
+	}
+	metric("llmgate_guard_checks_total", "counter", "Prompts sent to the injection classifier.", gs.Checks)
+	metric("llmgate_guard_flagged_total", "counter", "Prompts the classifier judged to be injections.", gs.Flagged)
+	metric("llmgate_guard_errors_total", "counter", "Classifier calls that failed or returned no verdict.", gs.Errors)
+	metric("llmgate_guard_cached_total", "counter", "Prompts answered from the verdict cache.", gs.Cached)
 
 	ps := s.deps.Router.Stats()
 	series := func(name, typ, help string, v func(router.ProviderStats) any) {

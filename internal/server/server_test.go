@@ -46,20 +46,28 @@ func (p *slowProvider) Chat(ctx context.Context, req providers.Request) (*provid
 
 func newTestServer(t testing.TB, p providers.Provider, mutate func(*config.Config)) *httptest.Server {
 	t.Helper()
+	return newTestServerDeps(t, p, mutate, nil)
+}
+
+func newTestServerDeps(t testing.TB, p providers.Provider, mutate func(*config.Config), deps func(*Deps)) *httptest.Server {
+	t.Helper()
 	cfg := config.Default()
 	cfg.Retry.Backoff = time.Millisecond
 	if mutate != nil {
 		mutate(cfg)
 	}
-	srv := New(Deps{
+	d := Deps{
 		Config:     cfg,
 		Router:     router.New([]providers.Provider{p}, cfg.Retry),
 		Guardrails: guardrails.New(cfg.Guardrails),
 		Meter:      metering.New(),
 		Cache:      cache.NewMemory(cfg.Cache.MaxEntries),
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
-	ts := httptest.NewServer(srv.Handler())
+	}
+	if deps != nil {
+		deps(&d)
+	}
+	ts := httptest.NewServer(New(d).Handler())
 	t.Cleanup(ts.Close)
 	return ts
 }

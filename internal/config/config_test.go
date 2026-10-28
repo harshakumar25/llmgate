@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -9,6 +10,7 @@ import (
 // every documented key must be understood.
 func TestExampleConfigLoads(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "ak")
+	t.Setenv("GEMINI_API_KEY", "gk")
 	cfg, err := Load("../../config.example.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -17,20 +19,20 @@ func TestExampleConfigLoads(t *testing.T) {
 	for _, p := range cfg.Providers {
 		names = append(names, p.Name)
 	}
-	if len(names) != 3 || names[0] != "openai" || names[1] != "anthropic" || names[2] != "ollama" {
+	if strings.Join(names, ",") != "openai,gemini,anthropic,ollama" {
 		t.Fatalf("providers = %v", names)
 	}
 	if m := cfg.Providers[0].Models; len(m) != 1 || m[0] != "gpt-4o" {
 		t.Fatalf("openai models = %q", m)
 	}
-	if m := cfg.Providers[2].Models; len(m) != 1 || m[0] != "*" {
+	if m := cfg.Providers[3].Models; len(m) != 1 || m[0] != "*" {
 		t.Fatalf("ollama models = %q (inline comment or quotes not stripped?)", m)
 	}
 	if !cfg.ModelFallback || cfg.UsageLog != "" || cfg.Budget.USDDaily != 0 {
 		t.Fatalf("fallback=%v usage_log=%q budget=%+v", cfg.ModelFallback, cfg.UsageLog, cfg.Budget)
 	}
-	if cfg.Providers[1].APIKey != "ak" {
-		t.Fatalf("api_key not expanded: %q", cfg.Providers[1].APIKey)
+	if cfg.Providers[1].APIKey != "gk" || cfg.Providers[2].APIKey != "ak" {
+		t.Fatalf("api_key not expanded: %q %q", cfg.Providers[1].APIKey, cfg.Providers[2].APIKey)
 	}
 	r := cfg.Retry
 	if r.MaxBackoff != 2*time.Second || r.BreakerFailures != 5 || r.BreakerCooldown != 30*time.Second {

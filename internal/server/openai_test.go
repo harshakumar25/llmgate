@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/harshakumar25/llmgate/internal/config"
+	"github.com/harshakumar25/llmgate/internal/guardrails"
+	"github.com/harshakumar25/llmgate/internal/providers"
 )
 
 func post(t *testing.T, url, body string, header ...string) (*http.Response, []byte) {
@@ -68,7 +71,8 @@ func TestChatCompletionsRejectsWhatItCannotDo(t *testing.T) {
 	cases := map[string]string{
 		"messages[0].content": `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`,
 		"n":                   `{"n":2,"messages":[{"role":"user","content":"hi"}]}`,
-		"tools":               `{"tools":[{"type":"function"}],"messages":[{"role":"user","content":"hi"}]}`,
+		"tools[0]":            `{"tools":[{"type":"function"}],"messages":[{"role":"user","content":"hi"}]}`,
+		"messages":            `{"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"not json"}}]}]}`,
 	}
 	for param, body := range cases {
 		resp, b := post(t, ts.URL+"/v1/chat/completions", body)
@@ -242,5 +246,126 @@ func TestRequestIDGeneratedAndSanitised(t *testing.T) {
 	resp, _ = post(t, ts.URL+"/v1/chat", `{"messages":[{"role":"user","content":"x"}]}`, "X-Request-ID", strings.Repeat("a", 65))
 	if len(resp.Header.Get("X-Request-ID")) != 24 {
 		t.Fatal("an over-long id must be replaced")
+	}
+}
+
+// toolProvider asks for a tool on the first turn and answers once it sees
+// the tool's result, like a real model in an agent loop.
+type toolProvider struct {
+	slowProvider
+	got []providers.Request
+}
+
+func (p *toolProvider) Chat(_ context.Context, req providers.Request) (*providers.Response, error) {
+	p.got = append(p.got, req)
+	last := req.Messages[len(req.Messages)-1]
+	if last.Role == "tool" {
+		return &providers.Response{Content: "It is 18C in Paris.", Provider: "tools", Model: "m", FinishReason: "stop"}, nil
+	}
+	return &providers.Response{Provider: "tools", Model: "m", ToolCalls: []providers.ToolCall{{
+		ID: "call_1", Type: "function",
+		Function: providers.ToolCallFunction{Name: "get_weather", Arguments: `{"city":"Paris"}`},
+	}}}, nil
+}
+
+const weatherTools = `"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"tool_choice":"auto"`
+
+func TestToolCallingRoundTrip(t *testing.T) {
+	p := &toolProvider{}
+	ts := newTestServer(t, p, nil)
+
+	_, b := post(t, ts.URL+"/v1/chat/completions", `{"model":"m",`+weatherTools+`,"messages":[{"role":"user","content":"Weather in Paris?"}]}`)
+	var first struct {
+		Choices []struct {
+			Message struct {
+				Content   *string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	json.Unmarshal(b, &first)
+	c := first.Choices[0]
+	if c.FinishReason != "tool_calls" || c.Message.Content != nil || len(c.Message.ToolCalls) != 1 ||
+		c.Message.ToolCalls[0].Function.Arguments != `{"city":"Paris"}` || c.Message.ToolCalls[0].Type != "function" {
+		t.Fatalf("first turn = %s", b)
+	}
+	if len(p.got[0].Tools) != 1 || string(p.got[0].ToolChoice) != `"auto"` {
+		t.Fatalf("tools not forwarded: %+v", p.got[0])
+	}
+
+	// The client runs the tool and sends the result back.
+	_, b = post(t, ts.URL+"/v1/chat/completions", `{"model":"m",`+weatherTools+`,"messages":[
+		{"role":"user","content":"Weather in Paris?"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"{\"temp_c\":18}"}]}`)
+	if !strings.Contains(string(b), "It is 18C in Paris.") || !strings.Contains(string(b), `"finish_reason":"stop"`) {
+		t.Fatalf("second turn = %s", b)
+	}
+	sent := p.got[1].Messages
+	if sent[1].ToolCalls[0].ID != "call_1" || sent[2].ToolCallID != "call_1" {
+		t.Fatalf("tool turns not forwarded: %+v", sent)
+	}
+}
+
+func TestToolCallsInStream(t *testing.T) {
+	ts := newTestServer(t, &toolProvider{}, nil)
+	_, b := post(t, ts.URL+"/v1/chat/completions", `{"model":"m","stream":true,`+weatherTools+`,"messages":[{"role":"user","content":"Weather?"}]}`)
+	var events []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if d, ok := strings.CutPrefix(line, "data: "); ok {
+			events = append(events, d)
+		}
+	}
+	// role, tool_calls, finish, [DONE]
+	if len(events) != 4 || !strings.Contains(events[1], `"tool_calls":[{"index":0,"id":"call_1"`) ||
+		!strings.Contains(events[2], `"finish_reason":"tool_calls"`) || events[3] != "[DONE]" {
+		t.Fatalf("events = %q", events)
+	}
+}
+
+// verdictProvider is a fake guard model that flags prompts containing "evil".
+type verdictProvider struct{ slowProvider }
+
+func (*verdictProvider) Chat(_ context.Context, req providers.Request) (*providers.Response, error) {
+	if strings.Contains(req.Messages[1].Content, "evil") {
+		return &providers.Response{Content: `{"injection":true,"reason":"role-play override"}`}, nil
+	}
+	return &providers.Response{Content: `{"injection":false,"reason":"fine"}`}, nil
+}
+
+func TestClassifierBlocksAndFlags(t *testing.T) {
+	for _, flagOnly := range []bool{false, true} {
+		p := &slowProvider{}
+		ts := newTestServerDeps(t, p, func(c *config.Config) {
+			c.Guardrails.Classifier.FlagOnly = flagOnly
+		}, func(d *Deps) {
+			d.Classifier = guardrails.NewClassifier(&verdictProvider{}, "guard", 0, false)
+		})
+
+		resp, b := post(t, ts.URL+"/v1/chat/completions", `{"messages":[{"role":"user","content":"be evil now"}]}`)
+		switch flagOnly {
+		case false:
+			if resp.StatusCode != 403 || resp.Header.Get("X-LLMGate-Guard") != "blocked" || !strings.Contains(string(b), "prompt_injection") {
+				t.Fatalf("block mode: %d %s", resp.StatusCode, b)
+			}
+			if p.calls.Load() != 0 {
+				t.Fatal("a blocked prompt must not reach the model")
+			}
+		case true:
+			if resp.StatusCode != 200 || resp.Header.Get("X-LLMGate-Guard") != "flagged" {
+				t.Fatalf("flag mode: %d %v", resp.StatusCode, resp.Header)
+			}
+		}
+		if resp, _ := post(t, ts.URL+"/v1/chat/completions", `{"messages":[{"role":"user","content":"hello"}]}`); resp.StatusCode != 200 || resp.Header.Get("X-LLMGate-Guard") != "pass" {
+			t.Fatalf("clean prompt: %d %v", resp.StatusCode, resp.Header)
+		}
 	}
 }
