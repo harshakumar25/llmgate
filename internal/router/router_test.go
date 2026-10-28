@@ -249,3 +249,62 @@ func TestClientWriteFailureDoesNotTripBreaker(t *testing.T) {
 		t.Fatalf("err=%v calls=%d open=%v", err, a.calls.Load(), r.Stats()[0].Open)
 	}
 }
+
+// modelFake records which model each call asked for.
+type modelFake struct {
+	name, model string
+	asked       []string
+	err         error
+}
+
+func (f *modelFake) Name() string { return f.name }
+func (f *modelFake) Chat(_ context.Context, req providers.Request) (*providers.Response, error) {
+	f.asked = append(f.asked, req.Model)
+	if f.err != nil {
+		return nil, f.err
+	}
+	m := req.Model
+	if m == "" {
+		m = f.model
+	}
+	return &providers.Response{Content: "ok", Model: m, Provider: f.name}, nil
+}
+
+func TestFailoverDoesNotSendForeignModelName(t *testing.T) {
+	openai := &modelFake{name: "openai", model: "gpt-4o-mini", err: status(503)}
+	ollama := &modelFake{name: "ollama", model: "llama3.2"}
+	r := NewWithModels([]providers.Provider{openai, ollama}, [][]string{{"gpt-4o-mini"}, {"llama3.2"}}, config.Retry{MaxAttempts: 1}, true)
+	r.sleep = func(context.Context, time.Duration) error { return nil }
+
+	resp, err := r.Route(context.Background(), providers.Request{Model: "gpt-4o-mini", Messages: req.Messages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if openai.asked[0] != "gpt-4o-mini" {
+		t.Fatalf("openai asked for %q", openai.asked[0])
+	}
+	if ollama.asked[0] != "" || resp.Model != "llama3.2" {
+		t.Fatalf("ollama was asked for %q (resp model %q); it must use its own model", ollama.asked[0], resp.Model)
+	}
+}
+
+func TestProvidersServingTheModelGoFirst(t *testing.T) {
+	a := &modelFake{name: "a", model: "small"}
+	b := &modelFake{name: "b", model: "big"}
+	r := NewWithModels([]providers.Provider{a, b}, [][]string{{"small"}, {"big"}}, config.Retry{MaxAttempts: 1}, true)
+	resp, err := r.Route(context.Background(), providers.Request{Model: "big", Messages: req.Messages})
+	if err != nil || resp.Provider != "b" || len(a.asked) != 0 {
+		t.Fatalf("resp=%v err=%v a.asked=%v; b serves big and should be tried first", resp, err, a.asked)
+	}
+}
+
+func TestUnknownModelWithoutSubstitution(t *testing.T) {
+	a := &modelFake{name: "a", model: "small"}
+	r := NewWithModels([]providers.Provider{a}, [][]string{{"small"}}, config.Retry{MaxAttempts: 1}, false)
+	if _, err := r.Route(context.Background(), providers.Request{Model: "nope", Messages: req.Messages}); !errors.Is(err, ErrUnknownModel) {
+		t.Fatalf("err = %v, want ErrUnknownModel", err)
+	}
+	if len(a.asked) != 0 {
+		t.Fatal("no provider should be called for an unknown model")
+	}
+}

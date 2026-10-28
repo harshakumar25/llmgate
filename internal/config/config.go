@@ -20,10 +20,19 @@ type Config struct {
 	Retry      Retry
 	Cache      Cache
 	RateLimit  RateLimit
+	Budget     Budget
 	Guardrails Guardrails
-	Database   string // DSN, e.g. postgres://... (used once you wire metering.NewPostgres)
+	Database   string // DSN, e.g. postgres://...; reserved for a database meter
 	Redis      string // addr, e.g. localhost:6379 (used once you wire cache.NewRedis)
 	APIKeys    []string
+
+	// ModelFallback lets providers that do not serve a requested model
+	// answer with their own, so failover works across vendors.
+	ModelFallback bool
+
+	// UsageLog is a JSON-lines file every metered call is appended to and
+	// replayed from on start. Empty keeps usage in memory only.
+	UsageLog string
 }
 
 // Provider describes one upstream model backend.
@@ -32,6 +41,17 @@ type Provider struct {
 	BaseURL string
 	APIKey  string // may reference ${ENV_VAR}
 	Model   string
+	// Models lists extra model names this provider accepts as-is, besides
+	// Model. "*" passes any name through (useful for a local Ollama with
+	// many models pulled).
+	Models []string
+	// Price in USD per million tokens, overriding the built-in table.
+	PriceIn, PriceOut float64
+}
+
+// Serves returns every model name this provider accepts as-is.
+func (p Provider) Serves() []string {
+	return append([]string{p.Model}, p.Models...)
 }
 
 // Retry controls the router's failover behaviour.
@@ -59,6 +79,12 @@ type RateLimit struct {
 	Burst     int // 0 means PerMinute
 }
 
+// Budget caps each API key's spend per UTC day. 0 disables a limit.
+type Budget struct {
+	USDDaily    float64
+	TokensDaily int
+}
+
 // Guardrails toggles the inbound safety filters.
 type Guardrails struct {
 	BlockPromptInjection bool
@@ -71,7 +97,7 @@ func Default() *Config {
 	return &Config{
 		Addr: ":8080",
 		Providers: []Provider{
-			{Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.2"},
+			{Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.2", Models: []string{"*"}},
 		},
 		Timeout: 60 * time.Second,
 		Retry: Retry{
@@ -81,8 +107,9 @@ func Default() *Config {
 			BreakerFailures: 5,
 			BreakerCooldown: 30 * time.Second,
 		},
-		Cache:      Cache{MaxEntries: 10_000, TTL: 5 * time.Minute},
-		Guardrails: Guardrails{BlockPromptInjection: true, RedactPII: true},
+		Cache:         Cache{MaxEntries: 10_000, TTL: 5 * time.Minute},
+		ModelFallback: true,
+		Guardrails:    Guardrails{BlockPromptInjection: true, RedactPII: true},
 	}
 }
 
@@ -130,6 +157,9 @@ func applyEnv(c *Config) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.Timeout = time.Duration(n) * time.Second
 		}
+	}
+	if v := os.Getenv("LLMGATE_USAGE_LOG"); v != "" {
+		c.UsageLog = v
 	}
 	if v := os.Getenv("LLMGATE_RATE_LIMIT_RPM"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -251,6 +281,14 @@ func applyTopLevel(c *Config, key, val string) {
 		if n, err := strconv.Atoi(val); err == nil {
 			c.Cache.TTL = time.Duration(n) * time.Second
 		}
+	case "budget_usd_daily":
+		c.Budget.USDDaily, _ = strconv.ParseFloat(val, 64)
+	case "budget_tokens_daily":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.Budget.TokensDaily = n
+		}
+	case "usage_log":
+		c.UsageLog = val
 	case "rate_limit_rpm":
 		if n, err := strconv.Atoi(val); err == nil {
 			c.RateLimit.PerMinute = n
@@ -259,6 +297,8 @@ func applyTopLevel(c *Config, key, val string) {
 		if n, err := strconv.Atoi(val); err == nil {
 			c.RateLimit.Burst = n
 		}
+	case "model_fallback":
+		c.ModelFallback = val == "true"
 	case "block_prompt_injection":
 		c.Guardrails.BlockPromptInjection = val == "true"
 	case "redact_pii":
@@ -278,6 +318,12 @@ func applyProvider(p *Provider, key, val string) {
 		p.APIKey = val
 	case "model":
 		p.Model = val
+	case "models":
+		p.Models = splitAndTrim(val, ",")
+	case "price_in":
+		p.PriceIn, _ = strconv.ParseFloat(val, 64)
+	case "price_out":
+		p.PriceOut, _ = strconv.ParseFloat(val, 64)
 	}
 }
 
@@ -286,7 +332,29 @@ func splitKV(s string) (string, string) {
 	if i < 0 {
 		return s, ""
 	}
-	return strings.TrimSpace(s[:i]), strings.Trim(strings.TrimSpace(s[i+1:]), `"'`)
+	val := stripComment(strings.TrimSpace(s[i+1:]))
+	return strings.TrimSpace(s[:i]), strings.Trim(val, `"'`)
+}
+
+// stripComment removes a trailing YAML comment: a '#' that starts the value
+// or follows whitespace, outside quotes. Without this, the example line
+// `api_key: ${OPENAI_API_KEY}   # expanded from the environment` set the key
+// to the variable plus the comment, and every OpenAI call failed with 401.
+func stripComment(v string) string {
+	var quote rune
+	for i, c := range v {
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '#' && (i == 0 || v[i-1] == ' ' || v[i-1] == '\t'):
+			return strings.TrimSpace(v[:i])
+		}
+	}
+	return v
 }
 
 func splitAndTrim(s, sep string) []string {

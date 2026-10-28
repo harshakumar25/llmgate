@@ -1,9 +1,13 @@
-// Package server wires the HTTP surface of the gateway: the chat endpoint,
-// health and status, a minimal Prometheus-style metrics endpoint, and API-key
-// auth middleware.
+// Package server wires the HTTP surface of the gateway: the native and
+// OpenAI-compatible chat endpoints, models and usage, health and status, a
+// Prometheus-style metrics endpoint, and the request-ID, logging, auth and
+// rate-limit middleware.
 package server
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
 	"math"
 	"net"
@@ -27,6 +31,7 @@ type Deps struct {
 	Router     *router.Router
 	Guardrails *guardrails.Guardrails
 	Meter      metering.Meter
+	Prices     *metering.Prices // nil prices with the built-in table only
 	Cache      cache.Cache
 	Logger     *slog.Logger
 }
@@ -59,8 +64,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /status", s.handleStatus)
-	mux.Handle("POST /v1/chat", s.authMiddleware(s.rateLimitMiddleware(http.HandlerFunc(s.handleChat))))
-	return s.logMiddleware(mux)
+	chat := func(h http.HandlerFunc) http.Handler { return s.authMiddleware(s.rateLimitMiddleware(h)) }
+	mux.Handle("POST /v1/chat", chat(s.handleChat))
+	mux.Handle("POST /v1/chat/completions", chat(s.handleChatCompletions))
+	mux.Handle("GET /v1/models", s.authMiddleware(http.HandlerFunc(s.handleModels)))
+	mux.Handle("GET /v1/usage", s.authMiddleware(http.HandlerFunc(s.handleUsage)))
+	return s.requestIDMiddleware(s.logMiddleware(mux))
 }
 
 // authMiddleware enforces a bearer API key when any keys are configured. With
@@ -115,12 +124,53 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+type ctxKey int
+
+const requestIDKey ctxKey = 0
+
+// requestIDMiddleware gives every request an ID: the caller's X-Request-ID
+// when it is sane, otherwise a fresh random one. It is echoed back, logged,
+// and used as the OpenAI completion id, so one value traces a request from
+// client to gateway logs.
+func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if !validRequestID(id) {
+			var b [12]byte
+			_, _ = rand.Read(b[:])
+			id = hex.EncodeToString(b[:])
+		}
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey, id)))
+	})
+}
+
+// validRequestID accepts short IDs of letters, digits, '-' and '_', so a
+// client cannot inject newlines or huge values into logs.
+func validRequestID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func requestID(r *http.Request) string {
+	id, _ := r.Context().Value(requestIDKey).(string)
+	return id
+}
+
 func (s *Server) logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
 		s.deps.Logger.Info("request",
+			"id", requestID(r),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", sw.status,

@@ -21,17 +21,25 @@ import (
 // ErrAllOpen is returned when every provider's circuit breaker is open.
 var ErrAllOpen = errors.New("all providers are cooling down after repeated failures")
 
+// ErrUnknownModel is returned when no provider serves the requested model and
+// substitution is off.
+var ErrUnknownModel = errors.New("no provider serves the requested model")
+
 // Router selects a provider and handles failover, retry and circuit breaking.
 type Router struct {
-	chain []*member
-	retry config.Retry
-	now   func() time.Time
-	sleep func(ctx context.Context, d time.Duration) error
+	chain      []*member
+	retry      config.Retry
+	substitute bool // let other providers answer with their own model
+	now        func() time.Time
+	sleep      func(ctx context.Context, d time.Duration) error
 }
 
 // member is one provider plus its breaker state and counters.
 type member struct {
 	p providers.Provider
+
+	models   map[string]bool // model names passed through as-is
+	anyModel bool            // "*": pass any model name through
 
 	mu        sync.Mutex
 	failures  int       // consecutive retryable failures
@@ -52,8 +60,22 @@ type ProviderStats struct {
 	Open    bool
 }
 
-// New builds a Router over an ordered provider chain.
+// New builds a Router over an ordered provider chain in which every provider
+// accepts any model name the client sends.
 func New(chain []providers.Provider, retry config.Retry) *Router {
+	models := make([][]string, len(chain))
+	for i := range models {
+		models[i] = []string{"*"}
+	}
+	return NewWithModels(chain, models, retry, true)
+}
+
+// NewWithModels builds a Router where models[i] lists the model names
+// chain[i] serves ("*" for any). A request naming a model goes first to the
+// providers that serve it. When substitute is true the remaining providers
+// are tried next with their own default model, so failover still works
+// across vendors; the response's model field says what actually answered.
+func NewWithModels(chain []providers.Provider, models [][]string, retry config.Retry, substitute bool) *Router {
 	if retry.MaxAttempts < 1 {
 		retry.MaxAttempts = 1
 	}
@@ -65,18 +87,67 @@ func New(chain []providers.Provider, retry config.Retry) *Router {
 	}
 	ms := make([]*member, len(chain))
 	for i, p := range chain {
-		ms[i] = &member{p: p}
+		m := &member{p: p, models: map[string]bool{}}
+		if i < len(models) {
+			for _, name := range models[i] {
+				if name == "*" {
+					m.anyModel = true
+				} else if name != "" {
+					m.models[name] = true
+				}
+			}
+		}
+		ms[i] = m
 	}
-	return &Router{chain: ms, retry: retry, now: time.Now, sleep: sleepCtx}
+	return &Router{chain: ms, retry: retry, substitute: substitute, now: time.Now, sleep: sleepCtx}
 }
 
 // Route tries each available provider in order. It retries a provider only on
 // retryable errors, and moves on immediately when the error says the request
 // itself was rejected. It returns the first success, or a joined error.
 func (r *Router) Route(ctx context.Context, req providers.Request) (*providers.Response, error) {
-	return r.run(ctx, func(p providers.Provider) (*providers.Response, error) {
+	plan, err := r.plan(req)
+	if err != nil {
+		return nil, err
+	}
+	return r.run(ctx, plan, func(p providers.Provider, req providers.Request) (*providers.Response, error) {
 		return p.Chat(ctx, req)
 	}, nil)
+}
+
+// target is one provider and the exact request it will receive.
+type target struct {
+	m   *member
+	req providers.Request
+}
+
+// plan orders the chain for one request. Providers that serve the requested
+// model come first, in chain order, and receive it unchanged. With
+// substitution on, the others follow with the model field cleared, so each
+// uses its own configured model instead of being sent a name it does not
+// know (asking Ollama for "gpt-4o-mini" is a guaranteed 404).
+func (r *Router) plan(req providers.Request) ([]target, error) {
+	if req.Model == "" {
+		out := make([]target, len(r.chain))
+		for i, m := range r.chain {
+			out[i] = target{m, req}
+		}
+		return out, nil
+	}
+	var serving, others []target
+	sub := req
+	sub.Model = ""
+	for _, m := range r.chain {
+		if m.anyModel || m.models[req.Model] {
+			serving = append(serving, target{m, req})
+		} else if r.substitute {
+			others = append(others, target{m, sub})
+		}
+	}
+	if len(serving)+len(others) == 0 {
+		return nil, ErrUnknownModel
+	}
+	return append(serving, others...), nil
 }
 
 // RouteStream is Route for streamed replies. onDelta receives text as it
@@ -93,7 +164,11 @@ func (r *Router) RouteStream(ctx context.Context, req providers.Request, onDelta
 		}
 		return nil
 	}
-	return r.run(ctx, func(p providers.Provider) (*providers.Response, error) {
+	plan, err := r.plan(req)
+	if err != nil {
+		return nil, err
+	}
+	return r.run(ctx, plan, func(p providers.Provider, req providers.Request) (*providers.Response, error) {
 		if s, ok := p.(providers.Streamer); ok {
 			return s.ChatStream(ctx, req, deliver)
 		}
@@ -119,10 +194,11 @@ func (e *clientError) Unwrap() error { return e.err }
 
 // run is the shared failover loop. committed, when set, reports whether output
 // has already reached the client, which forbids any further attempt.
-func (r *Router) run(ctx context.Context, call func(providers.Provider) (*providers.Response, error), committed func() bool) (*providers.Response, error) {
+func (r *Router) run(ctx context.Context, plan []target, call func(providers.Provider, providers.Request) (*providers.Response, error), committed func() bool) (*providers.Response, error) {
 	var errs []error
 	tried := false
-	for _, m := range r.chain {
+	for _, t := range plan {
+		m := t.m
 		probe, ok := r.admit(m)
 		if !ok {
 			continue
@@ -136,7 +212,7 @@ func (r *Router) run(ctx context.Context, call func(providers.Provider) (*provid
 				return nil, err
 			}
 			start := r.now()
-			resp, err := call(m.p)
+			resp, err := call(m.p, t.req)
 			// A caller that hung up, ran out of time or stopped reading says
 			// nothing about the provider's health, so it is recorded but not
 			// held against it.

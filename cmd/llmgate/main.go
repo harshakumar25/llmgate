@@ -38,11 +38,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	meter, err := metering.NewLedger(cfg.UsageLog)
+	if err != nil {
+		logger.Error("open usage log", "err", err)
+		os.Exit(1)
+	}
+
+	served := make([][]string, len(cfg.Providers))
+	for i, p := range cfg.Providers {
+		served[i] = p.Serves()
+	}
+
 	srv := server.New(server.Deps{
 		Config:     cfg,
-		Router:     router.New(chain, cfg.Retry),
+		Router:     router.NewWithModels(chain, served, cfg.Retry, cfg.ModelFallback),
 		Guardrails: guardrails.New(cfg.Guardrails),
-		Meter:      metering.New(),                                  // TODO: swap for metering.NewPostgres(cfg.Database)
+		Meter:      meter,
+		Prices:     metering.NewPrices(cfg.Providers),
 		Cache:      cache.NewRedis(cfg.Redis, cfg.Cache.MaxEntries), // in-memory when redis is unset
 		Logger:     logger,
 	})

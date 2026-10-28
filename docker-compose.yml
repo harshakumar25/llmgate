@@ -1,6 +1,6 @@
 # docker compose up  → gateway + Postgres + Redis.
 # With REDIS_ADDR set the gateway shares its completion cache through Redis.
-# Postgres is here for when metering.NewPostgres is implemented.
+# Postgres is provisioned for a future database meter; usage persists via usage_log.
 services:
   llmgate:
     build: .

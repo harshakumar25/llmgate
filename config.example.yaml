@@ -9,12 +9,21 @@ providers:
     base_url: https://api.openai.com
     api_key: ${OPENAI_API_KEY}   # expanded from the environment
     model: gpt-4o-mini
+    models: gpt-4o               # other names passed through as-is
   - name: anthropic
     api_key: ${ANTHROPIC_API_KEY}
     model: claude-haiku-5-5
+    # Prices in USD per 1M tokens; without them only well-known models are priced.
+    # price_in: 1.0
+    # price_out: 5.0
   - name: ollama
     base_url: http://localhost:11434
     model: llama3.2
+    models: "*"                  # any locally pulled model
+
+# When the requested model is not served by a provider, let it answer with its
+# own model (the reply's "model" field says which). false = 404 instead.
+model_fallback: true
 
 # Per upstream call. Raise it for slow local models (e.g. reasoning models on CPU).
 upstream_timeout_s: 60
@@ -46,6 +55,14 @@ rate_limit_burst: 0    # 0 = same as rate_limit_rpm
 
 # Comma-separated API keys. Leave empty to run open (local dev only).
 api_keys: ""
+
+# Per-key daily spend caps (UTC days). 0 = off. Over budget -> 429 insufficient_quota.
+budget_usd_daily: 0
+budget_tokens_daily: 0
+
+# Append every metered call to a JSON-lines file and replay it on start, so
+# usage and budgets survive restarts. Keys are stored as hashes. "" = memory only.
+usage_log: ""
 
 # Share the completion cache across replicas (built-in client, fails open).
 # redis: localhost:6379

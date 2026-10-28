@@ -1,133 +1,36 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
-	"github.com/harshakumar25/llmgate/internal/cache"
-	"github.com/harshakumar25/llmgate/internal/metering"
-	"github.com/harshakumar25/llmgate/internal/providers"
 	"github.com/harshakumar25/llmgate/internal/router"
 )
-
-// maxBodyBytes caps a chat request body. Large enough for long multi-turn
-// prompts, small enough that one client cannot exhaust memory.
-const maxBodyBytes = 1 << 20
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	var req providers.Request
-	body := http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	if err := json.NewDecoder(body).Decode(&req); err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("body exceeds %d bytes", maxBodyBytes))
-			return
+// handleUsage reports the caller's own usage for today (UTC) and how much of
+// its daily budget is left. A key can only ever see itself.
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	u := s.deps.Meter.Usage(bearerToken(r), time.Now())
+	out := map[string]any{"usage": u}
+	if b := s.deps.Config.Budget; b.USDDaily > 0 || b.TokensDaily > 0 {
+		budget := map[string]any{}
+		if b.USDDaily > 0 {
+			budget["usd_daily"] = b.USDDaily
+			budget["usd_remaining"] = max(0, b.USDDaily-u.CostUSD)
 		}
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "messages must not be empty")
-		return
-	}
-
-	// 1. Guardrails: block injection, redact PII in place.
-	if res := s.deps.Guardrails.Apply(&req); res.Blocked {
-		writeError(w, http.StatusForbidden, res.Reason)
-		return
-	}
-
-	// 2. Cache: return a prior identical completion if fresh. A client can
-	// force a fresh call with Cache-Control: no-cache.
-	key := cache.Key(req)
-	useCache := s.cacheTTL > 0 && !strings.Contains(r.Header.Get("Cache-Control"), "no-cache")
-	if useCache {
-		if cached, ok := s.deps.Cache.Get(key); ok {
-			if req.Stream {
-				s.streamCached(w, cached)
-				return
-			}
-			w.Header().Set("X-LLMGate-Cache", "hit")
-			writeJSON(w, http.StatusOK, cached)
-			return
+		if b.TokensDaily > 0 {
+			budget["tokens_daily"] = b.TokensDaily
+			budget["tokens_remaining"] = max(0, b.TokensDaily-u.Tokens)
 		}
+		out["budget"] = budget
 	}
-
-	if req.Stream {
-		s.streamChat(w, r, req, key, useCache)
-		return
-	}
-
-	// 3. Route across providers, coalescing identical requests already in
-	// flight into one upstream call. The shared call runs detached from any
-	// single client's context, so one caller hanging up does not fail the
-	// others; the upstream timeout still bounds it.
-	upstream := func() (*providers.Response, error) {
-		resp, err := s.deps.Router.Route(context.WithoutCancel(r.Context()), req)
-		if err != nil {
-			return nil, err
-		}
-		// 4. Meter once per upstream call, not once per waiting client.
-		s.deps.Meter.Record(metering.Record{
-			Time:     time.Now(),
-			APIKey:   bearerToken(r),
-			Provider: resp.Provider,
-			Model:    resp.Model,
-			Usage:    resp.Usage,
-			CostUSD:  metering.Cost(resp.Model, resp.Usage),
-		})
-		resp = s.redactOutput(resp)
-		if useCache {
-			s.deps.Cache.Set(key, resp, s.cacheTTL)
-		}
-		return resp, nil
-	}
-	var (
-		resp   *providers.Response
-		err    error
-		shared bool
-	)
-	if useCache {
-		resp, err, shared = s.flight.Do(key, upstream)
-	} else {
-		resp, err = upstream()
-	}
-	if err != nil {
-		s.writeRouteError(w, err)
-		return
-	}
-
-	switch {
-	case shared:
-		w.Header().Set("X-LLMGate-Cache", "coalesced")
-	case useCache:
-		w.Header().Set("X-LLMGate-Cache", "miss")
-	default:
-		w.Header().Set("X-LLMGate-Cache", "bypass")
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-// redactOutput returns resp with PII scrubbed from its content when output
-// redaction is on. It copies rather than mutates, because resp may be shared
-// with coalesced callers.
-func (s *Server) redactOutput(resp *providers.Response) *providers.Response {
-	text, n := s.deps.Guardrails.RedactOutput(resp.Content)
-	if n == 0 {
-		return resp
-	}
-	out := *resp
-	out.Content = text
-	return &out
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleMetrics emits Prometheus text exposition. Replace the hand-rolled
@@ -212,6 +115,42 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// Errors use OpenAI's shape on every endpoint, so SDK clients raise the right
+// exception type and native clients can keep reading error.message:
+//
+//	{"error": {"message": "...", "type": "rate_limit_error", "param": null, "code": "insufficient_quota"}}
+func apiError(status int, code, param, msg string) map[string]any {
+	typ := "api_error"
+	switch status {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
+		typ = "invalid_request_error"
+	case http.StatusUnauthorized:
+		typ = "authentication_error"
+	case http.StatusForbidden:
+		typ = "permission_error"
+	case http.StatusNotFound:
+		typ = "not_found_error"
+	case http.StatusTooManyRequests:
+		typ = "rate_limit_error"
+	}
+	e := map[string]any{"message": msg, "type": typ, "param": nil, "code": nil}
+	if code != "" {
+		e["code"] = code
+	}
+	if param != "" {
+		e["param"] = param
+	}
+	return e
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]any{"error": map[string]string{"message": msg}})
+	writeJSON(w, status, map[string]any{"error": apiError(status, "", "", msg)})
+}
+
+func writeErrorCode(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]any{"error": apiError(status, code, "", msg)})
+}
+
+func writeErrorParam(w http.ResponseWriter, status int, param, msg string) {
+	writeJSON(w, status, map[string]any{"error": apiError(status, "", param, msg)})
 }

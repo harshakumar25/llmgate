@@ -26,11 +26,13 @@
 
 ## What is LLMGate?
 
-LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go** with **zero external dependencies** at compile time. It presents a single OpenAI-compatible HTTP endpoint to client applications and handles all the plumbing that would otherwise pollute application code:
+LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go** with **zero external dependencies** at compile time. It speaks the **OpenAI Chat Completions API**, so existing apps switch to it by changing one `base_url`, and it handles all the plumbing that would otherwise pollute application code:
 
 | Problem | What LLMGate does | Where in code |
 |:---|:---|:---|
+| Apps are written against the OpenAI SDK | Drop-in `POST /v1/chat/completions` and `GET /v1/models` in OpenAI's exact shapes, streaming included | [`internal/server/openai.go`](internal/server/openai.go) |
 | Multiple providers, multiple wire formats | Normalized `Provider` interface; OpenAI, Ollama and Anthropic adapters | [`internal/providers`](internal/providers/) |
+| Failover to another vendor needs a different model name | Model-aware routing: providers that serve the requested model go first; the rest answer with their own model | [`internal/router`](internal/router/) |
 | Chat UIs need tokens as they are generated | SSE streaming from all three providers, one stream format for clients | [`internal/providers/stream.go`](internal/providers/stream.go) |
 | Provider outages & transient errors | Ordered failover, error-aware retry with jittered backoff, per-provider circuit breaker | [`internal/router`](internal/router/) |
 | Repeated identical requests wasting tokens | SHA-256 content-addressed, size-bounded LRU cache with TTL; optional Redis tier shared across replicas | [`internal/cache`](internal/cache/) |
@@ -38,7 +40,8 @@ LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go
 | Prompt injection & data exfiltration | Pre-flight heuristic regex scanner, returns `403` before hitting provider | [`internal/guardrails`](internal/guardrails/) |
 | PII leaking into cloud APIs | In-place regex redaction of email, card, SSN, IP, phone; optional redaction of replies too | [`internal/guardrails`](internal/guardrails/) |
 | One client exhausting the budget | Per-key token-bucket rate limit, `429` + `Retry-After` | [`internal/ratelimit`](internal/ratelimit/) |
-| No visibility into token spend | Per-call metering with USD estimate; Prometheus `/metrics` | [`internal/metering`](internal/metering/) |
+| No visibility into token spend | Per-key, per-model usage with input/output pricing, persisted to a ledger file; `GET /v1/usage`, Prometheus `/metrics` | [`internal/metering`](internal/metering/) |
+| A runaway client burning money | Per-key daily budget in USD or tokens; `429 insufficient_quota` | [`internal/server/chat.go`](internal/server/chat.go) |
 | Model regressions invisible until production | Golden-set eval harness in CI; fails build on quality drop | [`internal/eval`](internal/eval/) |
 
 > Most AI teams build a worse version of this in-house. LLMGate is a clean reference you can self-host, read in an afternoon, and extend.
@@ -156,19 +159,26 @@ type Config struct {
     Timeout    time.Duration  // per upstream call; default 60s
     Retry      Retry
     Guardrails Guardrails
-    Database   string         // DSN seam for metering.NewPostgres
-    Redis      string         // addr seam for cache.NewRedis
+    Cache      Cache          // LRU size + TTL
+    RateLimit  RateLimit      // per-key requests per minute
+    Budget     Budget         // per-key daily USD / token caps
+    Database   string         // reserved for a Postgres meter
+    Redis      string         // shared cache tier
     APIKeys    []string
+    ModelFallback bool        // cross-vendor model substitution
+    UsageLog   string         // JSON-lines usage ledger
 }
 ```
 
 **Priority chain** (later overrides earlier):
 1. `config.Default()` — ships working against local Ollama `:11434` with no config file.
 2. YAML file at `LLMGATE_CONFIG` — providers list, timeouts, guardrail toggles.
-3. Environment variables — `LLMGATE_ADDR`, `LLMGATE_UPSTREAM_TIMEOUT_S`, `LLMGATE_API_KEYS`, `LLMGATE_RATE_LIMIT_RPM`, `DATABASE_URL`, `REDIS_ADDR`.
+3. Environment variables — `LLMGATE_ADDR`, `LLMGATE_UPSTREAM_TIMEOUT_S`, `LLMGATE_API_KEYS`, `LLMGATE_RATE_LIMIT_RPM`, `LLMGATE_USAGE_LOG`, `DATABASE_URL`, `REDIS_ADDR`.
 4. `${ENV_VAR}` expansion inside YAML values — provider API keys never stored in files.
 
 Validation asserts: at least one provider, every provider has a name and model.
+
+**Inline comments** (`key: value   # note`) are stripped: a `#` at the start of a value or after whitespace, outside quotes. Earlier the parser kept them, so the example's `api_key: ${OPENAI_API_KEY}   # expanded from the environment` produced a key with the comment attached and every OpenAI call returned `401`. `TestExampleConfigLoads` now parses `config.example.yaml` itself, so the example and the parser cannot drift apart again.
 
 ---
 
@@ -357,6 +367,60 @@ flight.Do(key, fn):
 
 ---
 
+### Drop-in OpenAI Compatibility
+
+`POST /v1/chat/completions` and `GET /v1/models` accept and return OpenAI's exact shapes, so an app written against the OpenAI SDK moves behind the gateway by changing its base URL:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="<a gateway api_keys entry>")
+reply = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Capital of France?"}],
+)
+print(reply.choices[0].message.content)
+```
+
+It runs the same pipeline as `/v1/chat`: guardrails, cache, coalescing, budgets, failover, metering. Only the dialect differs.
+
+| Request field | Handling |
+|:---|:---|
+| `messages[].content` | String, or an array of `{"type":"text"}` parts (joined). Image/audio parts → `400` with `param` naming the message, rather than being silently dropped |
+| `max_tokens` / `max_completion_tokens` | Either; the newer name wins |
+| `temperature`, `response_format`, `stream`, `stream_options.include_usage` | Honoured |
+| `n` | Only `1`; anything else → `400` |
+| `tools` | Not supported yet → `400` (honest refusal, not a reply that ignores the tools) |
+| `think` | LLMGate extension for Ollama reasoning models; SDKs send it via `extra_body={"think": False}` |
+| anything else | Ignored, as OpenAI-compatible servers conventionally do |
+
+**Response.** `chat.completion` with `id: "chatcmpl-<request id>"`, `choices[0].message`, `finish_reason` (`"length"` when the reply used the whole `max_tokens`, else `"stop"`) and `usage`. The `X-LLMGate-Provider` header says which provider answered.
+
+**Streaming** emits `chat.completion.chunk` events in OpenAI's order: a first chunk with `delta.role: "assistant"`, one chunk per fragment, a final chunk with `finish_reason`, a usage chunk with empty `choices` when `stream_options.include_usage` is set, then `data: [DONE]`.
+
+**Errors** on every endpoint use OpenAI's envelope, `{"error":{"message","type","param","code"}}`, with `type` set from the status (`authentication_error`, `rate_limit_error`, `invalid_request_error`, `not_found_error`, …). SDK clients raise the matching exception class, and native clients can keep reading `error.message`.
+
+Verified live with OpenAI-format `curl` requests against Ollama (non-streamed, streamed with usage, models, errors). The SDK snippet above follows the same contract but is not exercised in CI, which has no Python.
+
+---
+
+### Model Routing
+
+Clients name a model; providers serve different ones. Before this, the gateway forwarded the client's model name to every provider in the chain. A request for `gpt-4o-mini` that failed over to Ollama asked Ollama for `gpt-4o-mini`, got a 404, and failed, so failover only worked for clients that sent no model at all.
+
+Each provider now declares what it serves: its `model`, plus an optional `models` list (`"*"` passes any name through, the default for the zero-config local Ollama). For each request the router builds a plan:
+
+```
+request model = "gpt-4o-mini"
+  1. providers that serve gpt-4o-mini, in chain order   → sent "gpt-4o-mini"
+  2. (model_fallback: true) every other provider        → sent its own model
+  none at all                                           → 404 model_not_found
+```
+
+The reply's `model` field (and `X-LLMGate-Provider`) says what actually answered, so a substitution is visible, never silent. Set `model_fallback: false` to refuse rather than substitute. Measured live: with OpenAI unreachable, a request for `gpt-4o-mini` was answered by `qwen3:4b` on Ollama and reported as such.
+
+---
+
 ### Streaming (SSE)
 
 Send `"stream": true` and the reply arrives as server-sent events, in one format whatever the provider:
@@ -452,38 +516,48 @@ Output: "Ship order #[REDACTED_CARD] to [REDACTED_EMAIL] from [REDACTED_IP]"
 
 ---
 
-### `internal/metering` — Token & Cost Accounting
+### `internal/metering` — Usage Ledger, Pricing & Budgets
 
-Every successful upstream call records a `metering.Record` synchronously on the response path:
+Every successful upstream call is metered once (not once per coalesced client) with the provider that answered, the model it used, and input and output tokens separately.
 
-```go
-type Record struct {
-    Time     time.Time
-    APIKey   string      // masked to last 4 chars in logs
-    Provider string
-    Model    string
-    Usage    providers.Usage   // PromptTokens, CompletionTokens, TotalTokens
-    CostUSD  float64
-}
+**Pricing.** Cost is `prompt_tokens × price_in + completion_tokens × price_out`, in USD per million tokens, because every major API prices output several times higher than input. A single blended rate per model (what this gateway used before) misprices chatty and terse workloads in opposite directions.
+
+| Source | Example |
+|:---|:---|
+| Built-in table, for list prices that are stable and well known | `gpt-4o-mini` $0.15 / $0.60, `gpt-4o` $2.50 / $10.00; dated snapshots like `gpt-4o-mini-2024-07-18` match by prefix |
+| Per-provider override in config | `price_in: 1.0` / `price_out: 5.0` on any provider entry |
+| Local providers (`ollama`) | Free unless priced explicitly |
+| Anything else | `0`, rather than an invented number |
+
+**Per-key, per-day usage.** The meter keeps lifetime totals for `/metrics` and, per API key, today's (UTC) calls, tokens and cost, broken down by model. Memory is bounded by the number of keys: older days only feed the lifetime totals.
+
+**Persistence without a database.** With `usage_log: /var/lib/llmgate/usage.jsonl` every record is appended as one JSON line and the file is replayed on start, so spend and budgets survive restarts and deploys:
+
+```json
+{"ts":"2026-10-28T09:19:09Z","key":"key_c48a01f49fd0","provider":"ollama","model":"qwen3:4b","prompt_tokens":24,"completion_tokens":30,"total_tokens":54,"cost_usd":0}
 ```
 
-**Cost estimation** uses a static price table keyed by model name (USD per 1K total tokens). Unknown models cost `0` — the field is present but zero, not absent:
+- **Keys are never written in the clear.** `key` is the first 12 hex characters of the key's SHA-256, so the ledger and logs can be shared with finance or support without leaking credentials. Tests assert the raw key never reaches the file.
+- **Crash-safe enough.** A line cut short by a crash is skipped on replay, not fatal.
+- The file is plain JSON lines: `jq`, DuckDB or a spreadsheet can read it directly.
 
-```go
-var pricePer1K = map[string]float64{
-    "gpt-4o-mini": 0.00075,
-    "gpt-4o":      0.0125,
-    "llama3.2":    0,      // local inference, zero API cost
-}
+**Budgets.** `budget_usd_daily: 5` or `budget_tokens_daily: 200000` caps each key per UTC day. The check runs after the cache lookup and before any upstream call:
 
-func Cost(model string, u providers.Usage) float64 {
-    return pricePer1K[model] * float64(u.TotalTokens) / 1000.0
-}
+| Situation | Result |
+|:---|:---|
+| Under budget | Served normally |
+| At or over budget, prompt is cached | Still served (`X-LLMGate-Cache: hit`): it costs nothing |
+| At or over budget, needs a model call | `429` with `{"type":"rate_limit_error","code":"insufficient_quota"}`, OpenAI's own code for this, so SDKs raise the usual exception |
+
+A request that starts under budget is allowed to finish, so a key can overshoot by one request's cost; the next one is refused.
+
+**`GET /v1/usage`** returns the caller's own usage and remaining budget. A key can only ever see itself:
+
+```json
+{"usage":{"key":"key_c48a01f49fd0","day":"2026-10-28","calls":2,"tokens":78,"cost_usd":0,
+          "models":{"qwen3:4b":{"calls":2,"prompt_tokens":36,"completion_tokens":42,"cost_usd":0}}},
+ "budget":{"tokens_daily":400,"tokens_remaining":322}}
 ```
-
-The `memMeter` accumulates counters under a `sync.Mutex` (not `sync.RWMutex` — writes dominate in high-frequency metering). `Totals()` is used only for `/status` and `/metrics` reads, which are infrequent.
-
-**Persistent metering seam:** `metering.NewPostgres(dsn string) Meter` already exists in the codebase. It returns `New()` (in-memory) until you add `pgx/v5` and implement the `INSERT` / `SUM` logic. The wiring in `cmd/llmgate/main.go` calls it with the config DSN — no structural change needed.
 
 ---
 
@@ -639,6 +713,17 @@ curl -s localhost:8080/v1/chat -d '{
 }' | jq
 ```
 
+### Point an existing OpenAI app at it
+
+```bash
+curl -s localhost:8080/v1/chat/completions -d '{
+  "model": "gpt-4o-mini",
+  "messages": [{"role":"user","content":"What is the capital of France?"}]
+}' | jq '.choices[0].message.content'
+```
+
+With no config file every model name passes through to the local Ollama, so use one you have pulled, or let the request fall back to the default model.
+
 ### With OpenAI + failover
 
 ```bash
@@ -653,7 +738,7 @@ LLMGATE_CONFIG=config.yaml go run ./cmd/llmgate
 docker compose up --build
 ```
 
-Services: `llmgate:8080`, `postgres:5432`, `redis:6379`. PostgreSQL and Redis containers are present and wired; driver implementations are the only remaining step.
+Services: `llmgate:8080`, `postgres:5432`, `redis:6379`. The gateway shares its cache through Redis. Postgres is provisioned for a future database meter; usage is persisted with `usage_log` today.
 
 ---
 
@@ -669,12 +754,18 @@ providers:
     base_url: https://api.openai.com
     api_key: ${OPENAI_API_KEY}
     model: gpt-4o-mini
+    models: gpt-4o            # other names passed through as-is
   - name: anthropic           # second
     api_key: ${ANTHROPIC_API_KEY}
     model: claude-haiku-5-5
+    price_in: 1.0             # USD per 1M input tokens (overrides the built-in table)
+    price_out: 5.0            # USD per 1M output tokens
   - name: ollama              # local fallback; no api_key needed
     base_url: http://localhost:11434
     model: llama3.2
+    models: "*"               # any locally pulled model
+
+model_fallback: true          # other providers may answer with their own model
 
 upstream_timeout_s: 60        # per upstream HTTP call
 max_attempts: 2               # attempts per provider before failover
@@ -696,6 +787,10 @@ rate_limit_burst: 0           # 0 = same as rate_limit_rpm
 
 api_keys: ""                  # comma-separated; empty = open (local dev only)
 
+budget_usd_daily: 0           # per key per UTC day; 0 = off
+budget_tokens_daily: 0
+usage_log: ""                 # JSON-lines ledger, replayed on start; "" = memory only
+
 # redis: localhost:6379       # share the cache across replicas
 # database: postgres://llmgate:llmgate@localhost:5432/llmgate?sslmode=disable
 ```
@@ -708,6 +803,7 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 | `LLMGATE_UPSTREAM_TIMEOUT_S` | `upstream_timeout_s` |
 | `LLMGATE_API_KEYS` | `api_keys` (comma-separated) |
 | `LLMGATE_RATE_LIMIT_RPM` | `rate_limit_rpm` |
+| `LLMGATE_USAGE_LOG` | `usage_log` |
 | `DATABASE_URL` | `database` |
 | `REDIS_ADDR` | `redis` |
 | `OPENAI_API_KEY` | expanded inside provider `api_key: ${OPENAI_API_KEY}` |
@@ -720,7 +816,10 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 
 | Method | Path | Auth | Description |
 |:---|:---|:---:|:---|
-| `POST` | `/v1/chat` | optional | Chat completion (OpenAI-compatible body) |
+| `POST` | `/v1/chat/completions` | optional | **OpenAI-compatible** chat completion, streaming or not |
+| `GET` | `/v1/models` | optional | Model names clients can request, OpenAI list format |
+| `GET` | `/v1/usage` | optional | The caller's own usage today and remaining budget |
+| `POST` | `/v1/chat` | optional | LLMGate's compact native dialect (same pipeline) |
 | `GET` | `/healthz` | — | Liveness probe → `{"status":"ok"}` |
 | `GET` | `/status` | — | JSON: calls, tokens, cost, cache + coalescing, per-provider calls/errors/avg latency/breaker |
 | `GET` | `/metrics` | — | Prometheus text exposition (no exporter needed) |
@@ -766,9 +865,9 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 }
 ```
 
-**Response headers:** `X-LLMGate-Cache: hit | miss | coalesced | bypass`, `Content-Type: application/json` (or `text/event-stream` when streaming), `X-RateLimit-Limit` / `X-RateLimit-Remaining` when rate limiting is on, and `Retry-After` on `429` and `503`.
+**Response headers:** `X-Request-ID` (the caller's, if sane, else generated; also the OpenAI completion `id` and the `id` field in gateway logs), `X-LLMGate-Provider` on OpenAI-format replies, `X-LLMGate-Cache: hit | miss | coalesced | bypass`, `Content-Type: application/json` (or `text/event-stream` when streaming), `X-RateLimit-Limit` / `X-RateLimit-Remaining` when rate limiting is on, and `Retry-After` on `429` and `503`.
 
-**Status codes:** `400` bad JSON or no messages · `401` bad API key · `403` blocked by guardrails · `413` body over 1 MiB · `429` rate limit · `502` all providers failed · `503` every provider's breaker is open.
+**Status codes:** `400` bad JSON or no messages · `401` bad API key · `403` blocked by guardrails · `413` body over 1 MiB · `404` unknown model (`model_fallback: false`) · `429` rate limit or budget (`code: insufficient_quota`) · `502` all providers failed · `503` every provider's breaker is open.
 
 ### Metrics (`GET /metrics`)
 
@@ -863,7 +962,7 @@ Performance on an Apple M4 (`make bench`):
 
 | Benchmark | Result |
 |:---|:---|
-| `BenchmarkHotPrompt`: full handler on a cached prompt (decode → guardrails → cache → encode), parallel | **~4.2 µs/op**, 80 allocs |
+| `BenchmarkHotPrompt`: full handler on a cached prompt (request ID → auth → decode → guardrails → cache → encode), parallel | **~5 µs/op**, 89 allocs |
 | `BenchmarkGetParallel`: cache lookup under contention | **~170 ns/op** |
 
 ```bash
@@ -887,7 +986,9 @@ cmd/
   eval/           main.go — standalone CLI eval runner against live gateway
 internal/
   config/         config.go — zero-dep YAML parser + env override
-  server/         server.go — HTTP mux, auth middleware, status-aware log middleware
+  server/         server.go — HTTP mux, request-ID, auth, rate-limit and log middleware
+                  chat.go — the shared chat pipeline, budgets, native dialect
+                  openai.go — OpenAI-compatible /v1/chat/completions and /v1/models
                   handlers.go — handleChat, handleHealth, handleMetrics, handleStatus
                   server_test.go — burst/coalescing, cache, 413, 503, metrics, benchmark
   providers/      provider.go — Provider interface, Request/Response types, Build()
@@ -901,7 +1002,8 @@ internal/
   cache/          cache.go — SHA-256 keyed bounded LRU with TTL
                   redis.go — Redis tier over a built-in RESP client, fails open
   ratelimit/      ratelimit.go — per-key token bucket
-  metering/       metering.go — Meter interface, memMeter, Cost(), NewPostgres seam
+  metering/       metering.go — per-key daily usage, JSON-lines ledger with replay
+                  prices.go — input/output pricing, config overrides
   eval/           eval.go — Run(), LoadCases(), Report, ChatFunc type
                   eval_test.go — TestGoldenSet CI quality gate + stubChat
                   testdata/golden.json — golden evaluation cases
@@ -929,6 +1031,10 @@ Makefile          Developer workflow targets
 | ✅ | Redis cache tier (zero-dependency RESP client, fails open) | `internal/cache/redis.go` |
 | ✅ | Per-key rate limiting (token bucket, `429`) | `internal/ratelimit/` |
 | ✅ | Output-side PII redaction | `guardrails.RedactOutput` |
+| ✅ | OpenAI-compatible `/v1/chat/completions`, `/v1/models` | `internal/server/openai.go` |
+| ✅ | Model-aware routing with cross-vendor fallback | `Router.plan` |
+| ✅ | Input/output pricing, per-key usage ledger, daily budgets | `internal/metering/`, `GET /v1/usage` |
+| ✅ | Request IDs end to end | `requestIDMiddleware` |
 | ✅ | Coalescing of identical in-flight requests | `internal/flight/flight.go` |
 | ✅ | Heuristic prompt-injection scanner (403) | `internal/guardrails/guardrails.go` |
 | ✅ | In-place PII redaction (5 entity types) | `internal/guardrails/guardrails.go` |
@@ -937,7 +1043,8 @@ Makefile          Developer workflow targets
 | ✅ | Golden-set CI eval gate | `internal/eval/` + `.github/workflows/eval.yml` |
 | ✅ | Distroless Docker container | `Dockerfile` |
 | ⬜ | Cache only deterministic requests by default (`temperature: 0`) | `handleChat` cache policy |
-| ⬜ | PostgreSQL metering backend | `metering.NewPostgres` stub exists |
+| ⬜ | PostgreSQL metering backend | `Meter` interface; `usage_log` covers persistence today |
+| ⬜ | OpenAI tool calling passthrough | `oaiRequest.Tools` is rejected with `400` today |
 | ⬜ | Semantic / embedding cache | needs embedding provider |
 | ⬜ | Gemini adapter | add a case in `providers.Build()` |
 | ⬜ | Output-side injection / policy scanning | post-router stage in `handleChat` |
