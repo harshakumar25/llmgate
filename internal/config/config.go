@@ -18,6 +18,7 @@ type Config struct {
 	Providers  []Provider
 	Timeout    time.Duration // per upstream call; slow local models need more
 	Retry      Retry
+	Cache      Cache
 	Guardrails Guardrails
 	Database   string // DSN, e.g. postgres://... (used once you wire metering.NewPostgres)
 	Redis      string // addr, e.g. localhost:6379 (used once you wire cache.NewRedis)
@@ -35,7 +36,19 @@ type Provider struct {
 // Retry controls the router's failover behaviour.
 type Retry struct {
 	MaxAttempts int
-	Backoff     time.Duration
+	Backoff     time.Duration // base delay; doubles per attempt, with jitter
+	MaxBackoff  time.Duration // cap on a single delay
+
+	// A provider that fails BreakerFailures times in a row is skipped for
+	// BreakerCooldown, then gets one trial call. 0 failures disables it.
+	BreakerFailures int
+	BreakerCooldown time.Duration
+}
+
+// Cache bounds the completion cache.
+type Cache struct {
+	MaxEntries int
+	TTL        time.Duration // 0 disables caching
 }
 
 // Guardrails toggles the inbound safety filters.
@@ -51,8 +64,15 @@ func Default() *Config {
 		Providers: []Provider{
 			{Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.2"},
 		},
-		Timeout:    60 * time.Second,
-		Retry:      Retry{MaxAttempts: 2, Backoff: 200 * time.Millisecond},
+		Timeout: 60 * time.Second,
+		Retry: Retry{
+			MaxAttempts:     2,
+			Backoff:         200 * time.Millisecond,
+			MaxBackoff:      2 * time.Second,
+			BreakerFailures: 5,
+			BreakerCooldown: 30 * time.Second,
+		},
+		Cache:      Cache{MaxEntries: 10_000, TTL: 5 * time.Minute},
 		Guardrails: Guardrails{BlockPromptInjection: true, RedactPII: true},
 	}
 }
@@ -196,6 +216,26 @@ func applyTopLevel(c *Config, key, val string) {
 	case "backoff_ms":
 		if n, err := strconv.Atoi(val); err == nil {
 			c.Retry.Backoff = time.Duration(n) * time.Millisecond
+		}
+	case "max_backoff_ms":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.Retry.MaxBackoff = time.Duration(n) * time.Millisecond
+		}
+	case "breaker_failures":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.Retry.BreakerFailures = n
+		}
+	case "breaker_cooldown_s":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.Retry.BreakerCooldown = time.Duration(n) * time.Second
+		}
+	case "cache_max_entries":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.Cache.MaxEntries = n
+		}
+	case "cache_ttl_s":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.Cache.TTL = time.Duration(n) * time.Second
 		}
 	case "block_prompt_injection":
 		c.Guardrails.BlockPromptInjection = val == "true"

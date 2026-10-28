@@ -31,8 +31,9 @@ LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go
 | Problem | What LLMGate does | Where in code |
 |:---|:---|:---|
 | Multiple providers, multiple wire formats | Normalized `Provider` interface; per-backend adapters | [`internal/providers`](internal/providers/) |
-| Provider outages & transient errors | Ordered failover chain with per-attempt retry and backoff | [`internal/router`](internal/router/) |
-| Repeated identical requests wasting tokens | SHA-256 content-addressed TTL cache (memory → Redis seam) | [`internal/cache`](internal/cache/) |
+| Provider outages & transient errors | Ordered failover, error-aware retry with jittered backoff, per-provider circuit breaker | [`internal/router`](internal/router/) |
+| Repeated identical requests wasting tokens | SHA-256 content-addressed, size-bounded LRU cache with TTL (memory → Redis seam) | [`internal/cache`](internal/cache/) |
+| Bursts of the same prompt hitting the model at once | Coalesces identical in-flight requests into one upstream call | [`internal/flight`](internal/flight/) |
 | Prompt injection & data exfiltration | Pre-flight heuristic regex scanner, returns `403` before hitting provider | [`internal/guardrails`](internal/guardrails/) |
 | PII leaking into cloud APIs | In-place regex redaction of email, card, SSN, IP, phone | [`internal/guardrails`](internal/guardrails/) |
 | No visibility into token spend | Per-call metering with USD estimate; Prometheus `/metrics` | [`internal/metering`](internal/metering/) |
@@ -48,7 +49,7 @@ LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go
 
 ![LLMGate 3D Architecture](assets/llmgate-architecture-3d.jpg)
 
-*Every inbound request passes through Auth → Guardrails → Cache → Router. Metering intercepts the response path. The shape is a strict pipeline: no goroutines per hop, no shared mutable state between stages.*
+*Every inbound request passes through Auth → Guardrails → Cache → Coalescing → Router. Metering intercepts the response path, once per upstream call. The shape is a strict pipeline: no goroutines per hop; the only state shared between requests is the cache, the in-flight table and the router's breaker counters, each behind its own mutex.*
 
 </div>
 
@@ -71,11 +72,13 @@ LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go
                         │   ① json.NewDecoder(r.Body).Decode(&req)                     │
                         │   ② Guardrails.Apply(&req) ──── 403 on injection             │
                         │   ③ Cache.Get(SHA256(req)) ─── 200 on hit                    │
-                        │   ④ Router.Route(ctx, req)                                   │
-                        │      ├─ Provider[0].Chat() ── retry loop                     │
+                        │   ④ flight.Do(key) ─── joins an identical in-flight call     │
+                        │      Router.Route(ctx, req)                                  │
+                        │      ├─ breaker open? ── skip provider                       │
+                        │      ├─ Provider[0].Chat() ── retry (5xx/429/timeout only)   │
                         │      └─ Provider[N].Chat() ── failover                       │
-                        │   ⑤ Meter.Record(usage, cost)                                │
-                        │   ⑥ Cache.Set(key, resp, 5m)                                 │
+                        │   ⑤ Meter.Record(usage, cost) ── once per upstream call      │
+                        │   ⑥ Cache.Set(key, resp, TTL) ── LRU, bounded                │
                         │   ⑦ json.NewEncoder(w).Encode(resp)                          │
                         │                                                               │
                         └──────────────────────────────────────────────────────────────┘
@@ -95,11 +98,13 @@ LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go
 Request Journey (happy path, cache miss):
 ─────────────────────────────────────────
   1. TCP accept → http.Server.Handler invokes logMiddleware
-  2. logMiddleware: slog.Info("request", method, path) → next
+  2. logMiddleware: wraps ResponseWriter, calls next, then
+     slog.Info("request", method, path, status, cache, ms)
   3. authMiddleware: bearerToken(r) lookup in apiKeys map[string]struct{}
      └─ if len(apiKeys)==0 → open (local dev)
      └─ if key missing    → 401 JSON {"error":{"message":"..."}}
-  4. json.Decode → providers.Request{Model, Messages[], Temperature, MaxTokens, ...}
+  4. json.Decode(MaxBytesReader(1 MiB)) → providers.Request{Model, Messages[], ...}
+     └─ body too large → 413
   5. Guardrails.Apply(&req) mutates req in place:
      ├─ For each user Message:
      │   ├─ matchInjection(content) → pattern scan over 5 compiled regexps
@@ -107,22 +112,30 @@ Request Journey (happy path, cache miss):
      │   └─ redact(content) → replace PII spans, res.Redactions++
      └─ returns Result{Blocked, Reason, Redactions}
   6. key := cache.Key(req)  // SHA-256(json.Marshal(req))
-     ├─ memCache.Get(key): RLock → lookup → check expiry → RUnlock
+     ├─ skipped when cache_ttl_s is 0 or the client sends Cache-Control: no-cache
+     ├─ memCache.Get(key): Lock → lookup → expired? drop : MoveToFront → Unlock
      └─ HIT: w.Header.Set("X-LLMGate-Cache","hit"), writeJSON(resp) → done
-  7. Router.Route(ctx, req):
+  7. flight.Do(key, upstream):
+     ├─ an identical call is in flight → wait for it, share its result
+     │   └─ X-LLMGate-Cache: coalesced
+     └─ otherwise run upstream() with context.WithoutCancel(r.Context()),
+        so one client hanging up does not fail the others waiting on it
+  8. Router.Route(ctx, req):
      for each Provider in chain:
+       breaker open and cooling down → skip (counted in skipped_total)
        for attempt := 1..MaxAttempts:
          resp, err := p.Chat(ctx, req)
-         if err==nil → return resp
-         slog.Warn("provider call failed", provider, attempt, err)
-         if attempt < MaxAttempts: select { <-ctx.Done | <-time.After(Backoff) }
+         if err==nil → reset failure streak, return resp
+         if !Retryable(err) → fail over now (400/401/404 cannot succeed)
+         sleep jittered backoff: d = min(base·2^(n-1), cap), wait ∈ [d/2, d)
+     no provider admitted → ErrAllOpen → 503 + Retry-After
      all fail → fmt.Errorf("all providers failed: %w", errors.Join(errs...))
-  8. Meter.Record(Record{Time, APIKey, Provider, Model, Usage, CostUSD})
+  9. Meter.Record(Record{Time, APIKey, Provider, Model, Usage, CostUSD})
      └─ memMeter: mu.Lock → tokens+=, cost+=, calls++ → mu.Unlock
      └─ slog.Info("metered", provider, model, total_tokens, cost_usd)
-  9. Cache.Set(key, resp, 5*time.Minute)
-     └─ memCache: mu.Lock → m[key]={resp, now+TTL} → mu.Unlock
- 10. w.Header.Set("X-LLMGate-Cache","miss"), writeJSON(resp) → 200 OK
+ 10. Cache.Set(key, resp, TTL)
+     └─ memCache: Lock → full? evict expired-near-tail else LRU tail → PushFront → Unlock
+ 11. w.Header.Set("X-LLMGate-Cache","miss"), writeJSON(resp) → 200 OK
 ```
 
 ---
@@ -227,39 +240,46 @@ Usage: Usage{
 
 ---
 
-### `internal/router` — Ordered Failover with Retry
+### `internal/router` — Failover, Error-Aware Retry, Circuit Breaker
 
-The router holds an ordered `[]providers.Provider` slice and a `config.Retry` (max attempts + fixed backoff). The algorithm is a simple nested loop — deliberately not recursive, no goroutines, no complex state machine:
+The router walks an ordered provider chain. Each provider carries its own breaker state and counters. The loop is still a plain nested loop with no goroutines; the decisions inside it are what changed:
 
 ```
 Route(ctx, req):
-  for p in chain:                         // try each provider
-    for attempt 1..MaxAttempts:           // retry this provider
+  for p in chain:
+    if !admit(p): continue                  // breaker open → skip, no network call
+    for attempt 1..MaxAttempts:
       resp, err = p.Chat(ctx, req)
-      if err == nil → return resp         // success, short-circuit everything
-      append err to errs
-      warn log
-      if attempt < MaxAttempts:
-        select { ctx.Done → return ctx err | time.After(Backoff) → continue }
-  return nil, errors.Join(errs...)        // all providers exhausted
+      record(p, latency, err)               // counters + breaker bookkeeping
+      if err == nil → return resp
+      if caller gone → return ctx.Err()     // never retry for a client that left
+      if !Retryable(err) → break            // fail over immediately
+      sleep(backoff(attempt))               // jittered, capped
+  if no provider was admitted → ErrAllOpen  // handler: 503 + Retry-After
+  return errors.Join(errs...)               // handler: 502
 ```
 
 **Failure mode taxonomy:**
 
-| Error type | Router behaviour |
-|:---|:---|
-| Provider HTTP 4xx (client error) | Counted as failure; retries & failover proceed |
-| Provider HTTP 5xx / timeout | Same; `ctx.Err()` check short-circuits on deadline |
-| Context cancelled by client | `ctx.Err()` returned immediately, no more attempts |
-| All providers fail all attempts | Joined error returned; handler writes `502 Bad Gateway` |
+| Error | Retry same provider? | Counts against breaker? | Result |
+|:---|:---:|:---:|:---|
+| `5xx`, `408`, `429`, transport error, upstream timeout | ✓ | ✓ | Retry with backoff, then fail over |
+| Other `4xx` (bad request, bad key, unknown model) | ✗ | ✗ | Fail over at once; a malformed request says nothing about provider health |
+| Caller cancelled / caller deadline | ✗ | ✗ | Return `ctx.Err()` immediately |
+| Every provider's breaker open | — | — | `503` + `Retry-After: breaker_cooldown_s`, no upstream call |
+| All admitted providers failed | — | — | `502 Bad Gateway` with the joined error |
 
-**No jitter on backoff** — intentional for a reference. A production fork should add `rand.Int63n(backoff)` to the sleep to avoid thundering-herd on shared providers.
+Providers return a typed `*providers.StatusError{Code}` for non-2xx replies, and `providers.Retryable(err)` makes the call.
+
+**Backoff.** `d = min(backoff_ms · 2^(attempt-1), max_backoff_ms)`, and the actual wait is drawn uniformly from `[d/2, d)`. Doubling backs off a struggling upstream; the jitter keeps many clients that failed together from retrying in lockstep.
+
+**Circuit breaker.** After `breaker_failures` consecutive retryable failures a provider is *open* for `breaker_cooldown_s`: requests skip it without a network call. When the cooldown ends it is *half-open*: exactly one request is admitted as a trial while others keep skipping it. A successful trial closes the breaker; a failed one reopens it for another cooldown. Without this, a dead primary costs every request a full `upstream_timeout_s` before failover.
 
 ---
 
-### `internal/cache` — Content-Addressed TTL Cache
+### `internal/cache` — Bounded LRU with TTL
 
-Cache correctness requires that two structurally-identical requests produce the same key regardless of JSON field ordering. LLMGate achieves this by serializing the full `providers.Request` struct (which has deterministic field ordering via struct layout) through `json.Marshal`, then hashing:
+Cache correctness requires that two structurally-identical requests produce the same key regardless of JSON field ordering. LLMGate serializes the full `providers.Request` struct (deterministic field order via struct layout) through `json.Marshal`, then hashes:
 
 ```go
 func Key(req providers.Request) string {
@@ -269,23 +289,36 @@ func Key(req providers.Request) string {
 }
 ```
 
-The in-memory implementation is a `map[string]entry` behind a `sync.RWMutex`. Reads use `RLock` (multiple concurrent readers); writes use `Lock`. Expiry is lazy — checked on read, not via a background sweeper:
+The in-memory implementation is a `container/list` LRU plus a `map[string]*list.Element`, behind one mutex. It is **bounded** (`cache_max_entries`, default 10,000), so memory cannot grow without limit:
 
-```go
-func (c *memCache) Get(key string) (*providers.Response, bool) {
-    c.mu.RLock()
-    e, ok := c.m[key]
-    c.mu.RUnlock()
-    if !ok || time.Now().After(e.expires) {
-        return nil, false  // lazy expiry; stale entry stays in map
-    }
-    return e.resp, true
-}
+| Operation | Behaviour |
+|:---|:---|
+| `Get` hit | Move entry to the front (most recently used) |
+| `Get` on expired entry | Delete it, count as `expired` + `miss` |
+| `Set` when full | Look at the 8 least-recent entries; drop an expired one if present, else evict the LRU tail |
+| `Stats()` | hits, misses, evictions, expired, entries → `/metrics` |
+
+**Bypass.** `cache_ttl_s: 0` turns caching (and coalescing) off. A client can force a fresh call per request with `Cache-Control: no-cache`; the response then carries `X-LLMGate-Cache: bypass`.
+
+**Scaling path:** the `Cache` interface is `Get`, `Set`, `Stats`. Swapping in Redis means implementing those and changing one line in `cmd/llmgate/main.go`; `cache.NewRedis` is the seam.
+
+---
+
+### `internal/flight` — Request Coalescing
+
+A cache only helps after the first answer lands. A burst of identical prompts that arrive *while the first is still running* (a retry storm, a fan-out, a popular question whose cache entry just expired) would all go upstream. `flight.Group` is a small generic take on `golang.org/x/sync/singleflight`:
+
+```
+flight.Do(key, fn):
+  key already in flight → wait on its WaitGroup, return the same (resp, err), shared=true
+  otherwise             → register key, run fn, release waiters, forget key (even on panic)
 ```
 
-**Scaling path:** The `Cache` interface has exactly two methods (`Get`, `Set`). Swapping in Redis requires implementing those two methods and updating the wiring in `cmd/llmgate/main.go`. The DSN seam is already wired from config: `cache.NewRedis(cfg.Redis)` is a one-line change once the driver is added.
+- The upstream call runs under `context.WithoutCancel(r.Context())`, so one waiting client hanging up does not fail the rest; `upstream_timeout_s` still bounds it.
+- Metering happens inside `fn`, so tokens are counted **once per upstream call**, not once per waiting client.
+- Errors are shared too, and the key is released, so the next request after a failure tries again.
 
-**Cache response header:** `X-LLMGate-Cache: hit` or `miss` lets clients and Grafana dashboards distinguish cache-served responses from upstream calls.
+**Measured:** in `TestBurstOfIdenticalRequestsMakesOneUpstreamCall`, 50 concurrent identical requests to a provider that takes 200 ms produce **1 upstream call** and 49 `coalesced` responses. Against a live `qwen3:4b` on Ollama, 20 concurrent identical requests made 1 model call, and the 21st was a cache hit.
 
 ---
 
@@ -559,8 +592,15 @@ providers:
     model: llama3.2
 
 upstream_timeout_s: 60        # per upstream HTTP call
-max_attempts: 2               # retries per provider before failover
-backoff_ms: 200               # fixed sleep between retries
+max_attempts: 2               # attempts per provider before failover
+backoff_ms: 200               # base retry delay; doubles per attempt, jittered
+max_backoff_ms: 2000          # cap on a single retry delay
+
+breaker_failures: 5           # consecutive retryable failures that open a breaker (0 = off)
+breaker_cooldown_s: 30        # how long an open provider is skipped
+
+cache_max_entries: 10000      # LRU bound
+cache_ttl_s: 300              # 0 disables caching and coalescing
 
 block_prompt_injection: true  # 403 on heuristic injection patterns
 redact_pii: true              # in-place regex redaction before provider
@@ -592,7 +632,7 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 |:---|:---|:---:|:---|
 | `POST` | `/v1/chat` | optional | Chat completion (OpenAI-compatible body) |
 | `GET` | `/healthz` | — | Liveness probe → `{"status":"ok"}` |
-| `GET` | `/status` | — | JSON: calls, tokens, cost, guardrail config |
+| `GET` | `/status` | — | JSON: calls, tokens, cost, cache + coalescing, per-provider calls/errors/avg latency/breaker |
 | `GET` | `/metrics` | — | Prometheus text exposition (no exporter needed) |
 
 ### Request
@@ -635,25 +675,39 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 }
 ```
 
-**Response headers:** `X-LLMGate-Cache: hit | miss`, `Content-Type: application/json`
+**Response headers:** `X-LLMGate-Cache: hit | miss | coalesced | bypass`, `Content-Type: application/json`, and `Retry-After` on `503`.
+
+**Status codes:** `400` bad JSON or no messages · `401` bad API key · `403` blocked by guardrails · `413` body over 1 MiB · `502` all providers failed · `503` every provider's breaker is open.
 
 ### Metrics (`GET /metrics`)
 
 Hand-rolled Prometheus text format (no `client_golang` dependency):
 
-```
-# HELP llmgate_calls_total Total chat calls served.
-# TYPE llmgate_calls_total counter
-llmgate_calls_total 127
+| Metric | Type | Meaning |
+|:---|:---|:---|
+| `llmgate_calls_total` | counter | Upstream chat calls that succeeded |
+| `llmgate_tokens_total` | counter | Tokens across all calls |
+| `llmgate_cost_usd_total` | counter | Estimated spend in USD |
+| `llmgate_cache_hits_total` / `_misses_total` | counter | Cache lookups |
+| `llmgate_cache_evictions_total` | counter | Entries dropped to stay under the bound |
+| `llmgate_cache_entries` | gauge | Entries currently cached |
+| `llmgate_coalesced_total` | counter | Requests that shared an in-flight upstream call |
+| `llmgate_upstream_flights_total` | counter | Coalescing groups that made an upstream call |
+| `llmgate_provider_calls_total{provider}` | counter | Calls per provider |
+| `llmgate_provider_errors_total{provider}` | counter | Failed calls per provider |
+| `llmgate_provider_skipped_total{provider}` | counter | Requests that skipped an open breaker |
+| `llmgate_provider_latency_seconds_total{provider}` | counter | Summed latency; divide by calls for the mean |
+| `llmgate_provider_breaker_open{provider}` | gauge | `1` while the breaker is open |
 
-# HELP llmgate_tokens_total Total tokens across all calls.
-# TYPE llmgate_tokens_total counter
-llmgate_tokens_total 9450
-
-# HELP llmgate_cost_usd_total Estimated spend in USD.
-# TYPE llmgate_cost_usd_total counter
-llmgate_cost_usd_total 0.007088
 ```
+llmgate_cache_hits_total 1
+llmgate_coalesced_total 19
+llmgate_upstream_flights_total 1
+llmgate_provider_calls_total{provider="ollama"} 1
+llmgate_provider_breaker_open{provider="ollama"} 0
+```
+
+*(From the live Ollama run above: 21 client requests, 1 model call.)*
 
 ---
 
@@ -711,9 +765,17 @@ spec:
 
 ## Development
 
+Performance on an Apple M4 (`make bench`):
+
+| Benchmark | Result |
+|:---|:---|
+| `BenchmarkHotPrompt`: full handler on a cached prompt (decode → guardrails → cache → encode), parallel | **~4.2 µs/op**, 80 allocs |
+| `BenchmarkGetParallel`: cache lookup under contention | **~170 ns/op** |
+
 ```bash
 make run        # go run ./cmd/llmgate (LLMGATE_CONFIG=config.yaml if present)
-make test       # go test ./... -count=1
+make test       # go test ./... -race -count=1
+make bench      # gateway overhead + cache benchmarks
 make eval       # go run ./cmd/eval -url http://localhost:8080/v1/chat
 make vet        # go vet ./...
 make build      # go build -o bin/llmgate ./cmd/llmgate
@@ -731,14 +793,16 @@ cmd/
   eval/           main.go — standalone CLI eval runner against live gateway
 internal/
   config/         config.go — zero-dep YAML parser + env override
-  server/         server.go — HTTP mux, auth middleware, log middleware
+  server/         server.go — HTTP mux, auth middleware, status-aware log middleware
                   handlers.go — handleChat, handleHealth, handleMetrics, handleStatus
+                  server_test.go — burst/coalescing, cache, 413, 503, metrics, benchmark
   providers/      provider.go — Provider interface, Request/Response types, Build()
                   openai.go — OpenAI adapter (POST /v1/chat/completions)
                   ollama.go — Ollama adapter (POST /api/chat, format translation)
-  router/         router.go — ordered failover with retry + backoff
+  router/         router.go — failover, error-aware retry, jittered backoff, circuit breaker
+  flight/         flight.go — coalescing of identical in-flight requests
   guardrails/     guardrails.go — injection scanner + PII redactor
-  cache/          cache.go — SHA-256 keyed TTL cache, memCache + NewRedis seam
+  cache/          cache.go — SHA-256 keyed bounded LRU with TTL + NewRedis seam
   metering/       metering.go — Meter interface, memMeter, Cost(), NewPostgres seam
   eval/           eval.go — Run(), LoadCases(), Report, ChatFunc type
                   eval_test.go — TestGoldenSet CI quality gate + stubChat
@@ -760,14 +824,17 @@ Makefile          Developer workflow targets
 | Status | Item | Seam in code |
 |:---:|:---|:---|
 | ✅ | OpenAI & Ollama provider adapters | `internal/providers/` |
-| ✅ | Ordered failover + configurable retry/backoff | `internal/router/router.go` |
-| ✅ | SHA-256 content-addressed in-memory cache | `internal/cache/cache.go` |
+| ✅ | Ordered failover, error-aware retry, jittered exponential backoff | `internal/router/router.go` |
+| ✅ | Per-provider circuit breaker with half-open trial | `internal/router/router.go` |
+| ✅ | SHA-256 content-addressed, bounded LRU cache | `internal/cache/cache.go` |
+| ✅ | Coalescing of identical in-flight requests | `internal/flight/flight.go` |
 | ✅ | Heuristic prompt-injection scanner (403) | `internal/guardrails/guardrails.go` |
 | ✅ | In-place PII redaction (5 entity types) | `internal/guardrails/guardrails.go` |
 | ✅ | Per-call token + USD metering (in-memory) | `internal/metering/metering.go` |
 | ✅ | Prometheus text metrics at `/metrics` | `internal/server/handlers.go` |
 | ✅ | Golden-set CI eval gate | `internal/eval/` + `.github/workflows/eval.yml` |
 | ✅ | Distroless Docker container | `Dockerfile` |
+| ⬜ | Cache only deterministic requests by default (`temperature: 0`) | `handleChat` cache policy |
 | ⬜ | SSE streaming passthrough | `handleChat` → `http.Flusher` |
 | ⬜ | PostgreSQL metering backend | `metering.NewPostgres` stub exists |
 | ⬜ | Redis cache backend | `cache.NewRedis` stub exists |

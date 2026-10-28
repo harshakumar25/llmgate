@@ -69,7 +69,7 @@ func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
 
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("openai: status %d: %s", resp.StatusCode, truncate(data, 300))
+		return nil, &StatusError{Provider: "openai", Code: resp.StatusCode, Body: truncate(data, 300)}
 	}
 
 	var parsed struct {

@@ -16,9 +16,21 @@ providers:
 # Per upstream call. Raise it for slow local models (e.g. reasoning models on CPU).
 upstream_timeout_s: 60
 
-# Failover / retry.
+# Failover / retry. Retryable errors (timeouts, 429, 5xx) back off
+# exponentially with jitter; other 4xx fail over to the next provider at once.
 max_attempts: 2
 backoff_ms: 200
+max_backoff_ms: 2000
+
+# Circuit breaker: after N retryable failures in a row a provider is skipped
+# for the cooldown, then gets one trial call. 0 disables it.
+breaker_failures: 5
+breaker_cooldown_s: 30
+
+# Completion cache (LRU). Identical in-flight requests are coalesced into one
+# upstream call whenever caching is on. cache_ttl_s: 0 turns both off.
+cache_max_entries: 10000
+cache_ttl_s: 300
 
 # Security guardrails (LLMGate's differentiator).
 block_prompt_injection: true

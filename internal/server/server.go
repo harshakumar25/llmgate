@@ -6,11 +6,14 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/harshakumar25/llmgate/internal/cache"
 	"github.com/harshakumar25/llmgate/internal/config"
+	"github.com/harshakumar25/llmgate/internal/flight"
 	"github.com/harshakumar25/llmgate/internal/guardrails"
 	"github.com/harshakumar25/llmgate/internal/metering"
+	"github.com/harshakumar25/llmgate/internal/providers"
 	"github.com/harshakumar25/llmgate/internal/router"
 )
 
@@ -26,8 +29,10 @@ type Deps struct {
 
 // Server holds dependencies and exposes an http.Handler.
 type Server struct {
-	deps    Deps
-	apiKeys map[string]struct{}
+	deps     Deps
+	apiKeys  map[string]struct{}
+	cacheTTL time.Duration
+	flight   flight.Group[*providers.Response]
 }
 
 // New builds a Server.
@@ -36,7 +41,7 @@ func New(d Deps) *Server {
 	for _, k := range d.Config.APIKeys {
 		keys[k] = struct{}{}
 	}
-	return &Server{deps: d, apiKeys: keys}
+	return &Server{deps: d, apiKeys: keys, cacheTTL: d.Config.Cache.TTL}
 }
 
 // Handler returns the configured router with middleware applied.
@@ -68,9 +73,28 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.deps.Logger.Info("request", "method", r.Method, "path", r.URL.Path)
-		next.ServeHTTP(w, r)
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		s.deps.Logger.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sw.status,
+			"cache", sw.Header().Get("X-LLMGate-Cache"),
+			"ms", time.Since(start).Milliseconds(),
+		)
 	})
+}
+
+// statusWriter records the status code a handler wrote, for logging.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 func bearerToken(r *http.Request) string {
