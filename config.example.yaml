@@ -9,6 +9,9 @@ providers:
     base_url: https://api.openai.com
     api_key: ${OPENAI_API_KEY}   # expanded from the environment
     model: gpt-4o-mini
+  - name: anthropic
+    api_key: ${ANTHROPIC_API_KEY}
+    model: claude-haiku-5-5
   - name: ollama
     base_url: http://localhost:11434
     model: llama3.2
@@ -35,10 +38,17 @@ cache_ttl_s: 300
 # Security guardrails (LLMGate's differentiator).
 block_prompt_injection: true
 redact_pii: true
+redact_output: false   # also scrub PII from replies (not from live stream fragments)
+
+# Per-key rate limit (API key, or client IP when api_keys is empty). 0 = off.
+rate_limit_rpm: 0
+rate_limit_burst: 0    # 0 = same as rate_limit_rpm
 
 # Comma-separated API keys. Leave empty to run open (local dev only).
 api_keys: ""
 
-# Optional backends (seams are wired; drivers are TODO).
-# database: postgres://llmgate:llmgate@localhost:5432/llmgate?sslmode=disable
+# Share the completion cache across replicas (built-in client, fails open).
 # redis: localhost:6379
+
+# Persistent metering (driver is TODO; in-memory until then).
+# database: postgres://llmgate:llmgate@localhost:5432/llmgate?sslmode=disable

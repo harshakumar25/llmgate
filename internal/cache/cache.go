@@ -1,7 +1,7 @@
 // Package cache stores and retrieves completions keyed by request content, so
 // identical requests skip the provider call. The default is a bounded
-// in-memory LRU with per-entry TTL; swap in a Redis-backed Cache (see
-// NewRedis) for a shared, persistent layer across replicas.
+// in-memory LRU with per-entry TTL; NewRedis adds a shared Redis tier behind
+// it so replicas reuse each other's completions.
 package cache
 
 import (
@@ -28,12 +28,17 @@ type Stats struct {
 	Misses    uint64
 	Evictions uint64 // dropped to stay under the size bound
 	Expired   uint64 // dropped because their TTL passed
-	Entries   int
+	Entries   int    // in local memory
+
+	// Redis tier only.
+	RemoteHits   uint64 // local misses answered by Redis
+	RemoteErrors uint64 // Redis calls that failed (treated as misses)
 }
 
 // Key derives a stable cache key from a request. Identical messages and
-// sampling settings produce the same key.
+// sampling settings produce the same key, whether or not the reply is streamed.
 func Key(req providers.Request) string {
+	req.Stream = false
 	b, _ := json.Marshal(req)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -140,17 +145,4 @@ func (c *memCache) evictOne() {
 func (c *memCache) remove(el *list.Element) {
 	c.ll.Remove(el)
 	delete(c.items, el.Value.(*entry).key)
-}
-
-// NewRedis is the seam for a shared cache.
-//
-// TODO: implement a Redis-backed Cache.
-//   1. go get github.com/redis/go-redis/v9
-//   2. Get: GET key -> json.Unmarshal into *providers.Response
-//   3. Set: json.Marshal + SET key val EX int(ttl.Seconds())
-//
-// Until then this returns the in-memory cache so the app runs with or without
-// Redis configured.
-func NewRedis(addr string, maxEntries int) Cache {
-	return NewMemory(maxEntries)
 }

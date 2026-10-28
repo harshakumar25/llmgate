@@ -19,6 +19,7 @@ type Config struct {
 	Timeout    time.Duration // per upstream call; slow local models need more
 	Retry      Retry
 	Cache      Cache
+	RateLimit  RateLimit
 	Guardrails Guardrails
 	Database   string // DSN, e.g. postgres://... (used once you wire metering.NewPostgres)
 	Redis      string // addr, e.g. localhost:6379 (used once you wire cache.NewRedis)
@@ -27,7 +28,7 @@ type Config struct {
 
 // Provider describes one upstream model backend.
 type Provider struct {
-	Name    string // "openai" | "ollama"
+	Name    string // "openai" | "ollama" | "anthropic"
 	BaseURL string
 	APIKey  string // may reference ${ENV_VAR}
 	Model   string
@@ -51,10 +52,18 @@ type Cache struct {
 	TTL        time.Duration // 0 disables caching
 }
 
+// RateLimit caps requests per API key (or per client IP when the gateway runs
+// without keys). PerMinute 0 disables it.
+type RateLimit struct {
+	PerMinute int
+	Burst     int // 0 means PerMinute
+}
+
 // Guardrails toggles the inbound safety filters.
 type Guardrails struct {
 	BlockPromptInjection bool
 	RedactPII            bool
+	RedactOutput         bool // also scrub PII from non-streamed replies
 }
 
 // Default returns a config that runs out of the box against a local Ollama.
@@ -120,6 +129,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("LLMGATE_UPSTREAM_TIMEOUT_S"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.Timeout = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("LLMGATE_RATE_LIMIT_RPM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.RateLimit.PerMinute = n
 		}
 	}
 	if v := os.Getenv("LLMGATE_API_KEYS"); v != "" {
@@ -237,10 +251,20 @@ func applyTopLevel(c *Config, key, val string) {
 		if n, err := strconv.Atoi(val); err == nil {
 			c.Cache.TTL = time.Duration(n) * time.Second
 		}
+	case "rate_limit_rpm":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.RateLimit.PerMinute = n
+		}
+	case "rate_limit_burst":
+		if n, err := strconv.Atoi(val); err == nil {
+			c.RateLimit.Burst = n
+		}
 	case "block_prompt_injection":
 		c.Guardrails.BlockPromptInjection = val == "true"
 	case "redact_pii":
 		c.Guardrails.RedactPII = val == "true"
+	case "redact_output":
+		c.Guardrails.RedactOutput = val == "true"
 	}
 }
 

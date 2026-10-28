@@ -174,3 +174,78 @@ func TestBackoffGrowsAndIsCapped(t *testing.T) {
 		}
 	}
 }
+
+// streamer is a fake that streams scripted fragments, optionally failing
+// after some of them.
+type streamer struct {
+	fake
+	parts   []string
+	failAt  int // fail after this many fragments; 0 = never
+	failErr error
+}
+
+func (s *streamer) ChatStream(_ context.Context, _ providers.Request, onDelta func(string) error) (*providers.Response, error) {
+	s.calls.Add(1)
+	text := ""
+	for i, p := range s.parts {
+		if s.failAt > 0 && i == s.failAt {
+			return nil, s.failErr
+		}
+		if err := onDelta(p); err != nil {
+			return nil, err
+		}
+		text += p
+	}
+	return &providers.Response{Content: text, Provider: s.name}, nil
+}
+
+func TestStreamFailsOverBeforeFirstByte(t *testing.T) {
+	bad := &fake{name: "bad", reply: always(status(503))}
+	good := &streamer{fake: fake{name: "good"}, parts: []string{"Hel", "lo"}}
+	r, _ := newTest(config.Retry{MaxAttempts: 2}, bad, good)
+
+	var got []string
+	resp, err := r.RouteStream(context.Background(), req, func(d string) error { got = append(got, d); return nil })
+	if err != nil || resp.Provider != "good" || len(got) != 2 {
+		t.Fatalf("resp=%v err=%v got=%q", resp, err, got)
+	}
+	if bad.calls.Load() != 2 {
+		t.Fatalf("bad called %d times, want 2 (retried before first byte)", bad.calls.Load())
+	}
+}
+
+func TestStreamDoesNotFailOverAfterFirstByte(t *testing.T) {
+	a := &streamer{fake: fake{name: "a"}, parts: []string{"Hel", "lo"}, failAt: 1, failErr: status(503)}
+	b := &streamer{fake: fake{name: "b"}, parts: []string{"other"}}
+	r, _ := newTest(config.Retry{MaxAttempts: 3}, a, b)
+
+	var got []string
+	_, err := r.RouteStream(context.Background(), req, func(d string) error { got = append(got, d); return nil })
+	if err == nil || len(got) != 1 || got[0] != "Hel" {
+		t.Fatalf("err=%v got=%q, want the stream to end after Hel", err, got)
+	}
+	if a.calls.Load() != 1 || b.calls.Load() != 0 {
+		t.Fatalf("calls a=%d b=%d; nothing may run after output started", a.calls.Load(), b.calls.Load())
+	}
+}
+
+func TestStreamFallsBackToChatForNonStreamers(t *testing.T) {
+	p := &fake{name: "plain", reply: always(nil)}
+	r, _ := newTest(config.Retry{MaxAttempts: 1}, p)
+	var got []string
+	if _, err := r.RouteStream(context.Background(), req, func(d string) error { got = append(got, d); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "ok" {
+		t.Fatalf("got %q, want one fragment with the whole reply", got)
+	}
+}
+
+func TestClientWriteFailureDoesNotTripBreaker(t *testing.T) {
+	a := &streamer{fake: fake{name: "a"}, parts: []string{"x"}}
+	r, _ := newTest(config.Retry{MaxAttempts: 3, BreakerFailures: 1}, a)
+	_, err := r.RouteStream(context.Background(), req, func(string) error { return errors.New("broken pipe") })
+	if err == nil || a.calls.Load() != 1 || r.Stats()[0].Open {
+		t.Fatalf("err=%v calls=%d open=%v", err, a.calls.Load(), r.Stats()[0].Open)
+	}
+}

@@ -42,8 +42,8 @@ func main() {
 		Config:     cfg,
 		Router:     router.New(chain, cfg.Retry),
 		Guardrails: guardrails.New(cfg.Guardrails),
-		Meter:      metering.New(),                        // TODO: swap for metering.NewPostgres(cfg.Database)
-		Cache:      cache.NewMemory(cfg.Cache.MaxEntries), // TODO: swap for cache.NewRedis(cfg.Redis, ...)
+		Meter:      metering.New(),                                  // TODO: swap for metering.NewPostgres(cfg.Database)
+		Cache:      cache.NewRedis(cfg.Redis, cfg.Cache.MaxEntries), // in-memory when redis is unset
 		Logger:     logger,
 	})
 

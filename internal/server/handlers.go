@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -53,10 +52,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	useCache := s.cacheTTL > 0 && !strings.Contains(r.Header.Get("Cache-Control"), "no-cache")
 	if useCache {
 		if cached, ok := s.deps.Cache.Get(key); ok {
+			if req.Stream {
+				s.streamCached(w, cached)
+				return
+			}
 			w.Header().Set("X-LLMGate-Cache", "hit")
 			writeJSON(w, http.StatusOK, cached)
 			return
 		}
+	}
+
+	if req.Stream {
+		s.streamChat(w, r, req, key, useCache)
+		return
 	}
 
 	// 3. Route across providers, coalescing identical requests already in
@@ -77,6 +85,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Usage:    resp.Usage,
 			CostUSD:  metering.Cost(resp.Model, resp.Usage),
 		})
+		resp = s.redactOutput(resp)
 		if useCache {
 			s.deps.Cache.Set(key, resp, s.cacheTTL)
 		}
@@ -93,12 +102,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		resp, err = upstream()
 	}
 	if err != nil {
-		if errors.Is(err, router.ErrAllOpen) {
-			w.Header().Set("Retry-After", strconv.Itoa(int(s.deps.Config.Retry.BreakerCooldown.Seconds())))
-			writeError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("upstream failed: %v", err))
+		s.writeRouteError(w, err)
 		return
 	}
 
@@ -111,6 +115,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-LLMGate-Cache", "bypass")
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// redactOutput returns resp with PII scrubbed from its content when output
+// redaction is on. It copies rather than mutates, because resp may be shared
+// with coalesced callers.
+func (s *Server) redactOutput(resp *providers.Response) *providers.Response {
+	text, n := s.deps.Guardrails.RedactOutput(resp.Content)
+	if n == 0 {
+		return resp
+	}
+	out := *resp
+	out.Content = text
+	return &out
 }
 
 // handleMetrics emits Prometheus text exposition. Replace the hand-rolled
@@ -131,7 +148,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metric("llmgate_cache_hits_total", "counter", "Requests served from the cache.", cs.Hits)
 	metric("llmgate_cache_misses_total", "counter", "Cache lookups that missed.", cs.Misses)
 	metric("llmgate_cache_evictions_total", "counter", "Entries dropped to stay under the size bound.", cs.Evictions)
-	metric("llmgate_cache_entries", "gauge", "Entries currently cached.", cs.Entries)
+	metric("llmgate_cache_entries", "gauge", "Entries in the local cache tier.", cs.Entries)
+	metric("llmgate_cache_remote_hits_total", "counter", "Local misses answered by Redis.", cs.RemoteHits)
+	metric("llmgate_cache_remote_errors_total", "counter", "Redis calls that failed and were treated as misses.", cs.RemoteErrors)
+	var limited uint64
+	if s.limiter != nil {
+		limited = s.limiter.Limited()
+	}
+	metric("llmgate_rate_limited_total", "counter", "Requests rejected with 429 by the per-key rate limit.", limited)
 	metric("llmgate_coalesced_total", "counter", "Requests that shared an identical in-flight upstream call.", shared)
 	metric("llmgate_upstream_flights_total", "counter", "Coalescing groups that made an upstream call.", leaders)
 

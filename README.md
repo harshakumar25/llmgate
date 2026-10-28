@@ -30,12 +30,14 @@ LLMGate is a small, readable, self-hostable **LLM API gateway written in pure Go
 
 | Problem | What LLMGate does | Where in code |
 |:---|:---|:---|
-| Multiple providers, multiple wire formats | Normalized `Provider` interface; per-backend adapters | [`internal/providers`](internal/providers/) |
+| Multiple providers, multiple wire formats | Normalized `Provider` interface; OpenAI, Ollama and Anthropic adapters | [`internal/providers`](internal/providers/) |
+| Chat UIs need tokens as they are generated | SSE streaming from all three providers, one stream format for clients | [`internal/providers/stream.go`](internal/providers/stream.go) |
 | Provider outages & transient errors | Ordered failover, error-aware retry with jittered backoff, per-provider circuit breaker | [`internal/router`](internal/router/) |
-| Repeated identical requests wasting tokens | SHA-256 content-addressed, size-bounded LRU cache with TTL (memory → Redis seam) | [`internal/cache`](internal/cache/) |
+| Repeated identical requests wasting tokens | SHA-256 content-addressed, size-bounded LRU cache with TTL; optional Redis tier shared across replicas | [`internal/cache`](internal/cache/) |
 | Bursts of the same prompt hitting the model at once | Coalesces identical in-flight requests into one upstream call | [`internal/flight`](internal/flight/) |
 | Prompt injection & data exfiltration | Pre-flight heuristic regex scanner, returns `403` before hitting provider | [`internal/guardrails`](internal/guardrails/) |
-| PII leaking into cloud APIs | In-place regex redaction of email, card, SSN, IP, phone | [`internal/guardrails`](internal/guardrails/) |
+| PII leaking into cloud APIs | In-place regex redaction of email, card, SSN, IP, phone; optional redaction of replies too | [`internal/guardrails`](internal/guardrails/) |
+| One client exhausting the budget | Per-key token-bucket rate limit, `429` + `Retry-After` | [`internal/ratelimit`](internal/ratelimit/) |
 | No visibility into token spend | Per-call metering with USD estimate; Prometheus `/metrics` | [`internal/metering`](internal/metering/) |
 | Model regressions invisible until production | Golden-set eval harness in CI; fails build on quality drop | [`internal/eval`](internal/eval/) |
 
@@ -163,7 +165,7 @@ type Config struct {
 **Priority chain** (later overrides earlier):
 1. `config.Default()` — ships working against local Ollama `:11434` with no config file.
 2. YAML file at `LLMGATE_CONFIG` — providers list, timeouts, guardrail toggles.
-3. Environment variables — `LLMGATE_ADDR`, `LLMGATE_UPSTREAM_TIMEOUT_S`, `LLMGATE_API_KEYS`, `DATABASE_URL`, `REDIS_ADDR`.
+3. Environment variables — `LLMGATE_ADDR`, `LLMGATE_UPSTREAM_TIMEOUT_S`, `LLMGATE_API_KEYS`, `LLMGATE_RATE_LIMIT_RPM`, `DATABASE_URL`, `REDIS_ADDR`.
 4. `${ENV_VAR}` expansion inside YAML values — provider API keys never stored in files.
 
 Validation asserts: at least one provider, every provider has a name and model.
@@ -179,6 +181,11 @@ type Provider interface {
     Name() string
     Chat(ctx context.Context, req Request) (*Response, error)
 }
+
+// Optional: providers that can stream implement this too.
+type Streamer interface {
+    ChatStream(ctx context.Context, req Request, onDelta func(string) error) (*Response, error)
+}
 ```
 
 `Request` is the gateway's canonical internal type — an intentional superset of both backends:
@@ -191,6 +198,7 @@ type Request struct {
     MaxTokens      int             `json:"max_tokens,omitempty"`
     ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
     Think          *bool           `json:"think,omitempty"`  // nil = don't send
+    Stream         bool            `json:"stream,omitempty"` // transport only; not part of the cache key
 }
 ```
 
@@ -218,13 +226,15 @@ Response parsing extracts `choices[0].message.content` and maps the OpenAI `usag
 
 Ollama uses a structurally different API. The adapter translates every field:
 
-| LLMGate `Request` field | OpenAI wire field | Ollama wire field | Notes |
-|:---|:---|:---|:---|
-| `Temperature` | `temperature` (top-level) | `options.temperature` | Ollama nests sampling under `options{}` |
-| `MaxTokens` | `max_tokens` (top-level) | `options.num_predict` | Different field name |
-| `ResponseFormat.Type == "json_object"` | `response_format: {"type":"json_object"}` | `format: "json"` | Different key and value |
-| `Think` | Not supported | `think: bool` | Ollama-only reasoning toggle |
-| *(implicit)* | *(absent)* | `stream: false` | Ollama defaults to streaming; must explicitly disable |
+| LLMGate `Request` field | OpenAI wire field | Ollama wire field | Anthropic wire field | Notes |
+|:---|:---|:---|:---|:---|
+| `system` messages | in `messages` | in `messages` | top-level `system` string | Anthropic lifts system turns out of the list |
+| `Temperature` | `temperature` (top-level) | `options.temperature` | `temperature` | Ollama nests sampling under `options{}` |
+| `MaxTokens` | `max_tokens` (top-level) | `options.num_predict` | `max_tokens` (**required**, default 1024) | Different names, different rules |
+| `ResponseFormat.Type == "json_object"` | `response_format: {"type":"json_object"}` | `format: "json"` | not sent | Different key and value |
+| `Think` | Not supported | `think: bool` | not sent | Ollama-only reasoning toggle |
+| `Stream` | `stream: true` + `stream_options.include_usage` | `stream: true` | `stream: true` | Ollama defaults to streaming; `Chat` sends `stream: false` |
+| auth | `Authorization: Bearer` | none | `x-api-key` + `anthropic-version: 2023-06-01` | |
 
 Usage is reconstructed from Ollama's `prompt_eval_count` and `eval_count` fields:
 
@@ -236,7 +246,21 @@ Usage: Usage{
 },
 ```
 
-**Adding a new provider** is exactly two steps: implement the `Provider` interface, add a `case "name":` in `providers.Build()`.
+Non-2xx replies from every adapter come back as a typed `*providers.StatusError{Provider, Code, Body}`, which the router uses to decide whether a retry can help.
+
+#### Streaming wire formats
+
+Each provider streams differently; the adapters turn all three into the same `onDelta(text)` callback plus a final `Response` with exact usage:
+
+| Provider | Framing | Text lives in | Token counts arrive in |
+|:---|:---|:---|:---|
+| OpenAI | SSE `data:` lines, ends with `data: [DONE]` | `choices[0].delta.content` | last chunk's `usage` (requested with `include_usage`) |
+| Ollama | newline-delimited JSON objects | `message.content` | final object with `done: true` (`prompt_eval_count`, `eval_count`) |
+| Anthropic | SSE `event:` + `data:` pairs | `content_block_delta` → `delta.text` | `message_start` (input) and `message_delta` (output) |
+
+One scanner (`scanLines`, `scanSSE` in `stream.go`) handles framing for all three, with a 1 MiB line limit for large events.
+
+**Adding a new provider** is two steps: implement the `Provider` interface (and `Streamer` if it can stream), and add a `case "name":` in `providers.Build()`. A provider without `Streamer` still works for streaming clients: the router calls `Chat` and delivers the reply as one fragment.
 
 ---
 
@@ -300,7 +324,18 @@ The in-memory implementation is a `container/list` LRU plus a `map[string]*list.
 
 **Bypass.** `cache_ttl_s: 0` turns caching (and coalescing) off. A client can force a fresh call per request with `Cache-Control: no-cache`; the response then carries `X-LLMGate-Cache: bypass`.
 
-**Scaling path:** the `Cache` interface is `Get`, `Set`, `Stats`. Swapping in Redis means implementing those and changing one line in `cmd/llmgate/main.go`; `cache.NewRedis` is the seam.
+#### Redis tier (`redis.go`, zero dependencies)
+
+Set `redis: host:6379` (or `REDIS_ADDR`) and replicas share completions. The cache becomes two tiers: the local LRU above in front of Redis.
+
+| Step | What happens |
+|:---|:---|
+| `Get` | Local LRU first. On a local miss, `GET` and `PTTL` go to Redis in **one pipelined round trip**; a hit is copied into the local tier with Redis's remaining TTL, so both copies expire together |
+| `Set` | Write local, then `SET key value PX ttl_ms` |
+| Keys | `llmgate:v1:<sha256>`; bump the version if the stored shape changes |
+| Failure | **Fails open.** 250 ms deadline per call; on any error the connection is dropped, the lookup counts as a miss and the request goes to the provider. A Redis outage costs money, never availability. Counted in `llmgate_cache_remote_errors_total` |
+
+The client speaks just enough of the Redis protocol (RESP: arrays of bulk strings out; simple, error, integer and bulk replies in) over a small connection pool, about 200 lines, so `go.mod` stays empty. `redis_test.go` runs it against an in-process fake Redis server, so CI needs no Redis.
 
 ---
 
@@ -319,6 +354,50 @@ flight.Do(key, fn):
 - Errors are shared too, and the key is released, so the next request after a failure tries again.
 
 **Measured:** in `TestBurstOfIdenticalRequestsMakesOneUpstreamCall`, 50 concurrent identical requests to a provider that takes 200 ms produce **1 upstream call** and 49 `coalesced` responses. Against a live `qwen3:4b` on Ollama, 20 concurrent identical requests made 1 model call, and the 21st was a cache hit.
+
+---
+
+### Streaming (SSE)
+
+Send `"stream": true` and the reply arrives as server-sent events, in one format whatever the provider:
+
+```
+data: {"delta":"Hel"}
+data: {"delta":"lo"}
+data: {"done":true,"model":"qwen3:4b","provider":"ollama","usage":{"prompt_tokens":21,"completion_tokens":40,"total_tokens":61}}
+data: [DONE]
+```
+
+```bash
+curl -N localhost:8080/v1/chat -d '{"stream":true,"messages":[{"role":"user","content":"Count to 8"}]}'
+```
+
+**The commit point.** `Router.RouteStream` retries and fails over exactly like `Route` *until the first fragment reaches the client*. After that the client already holds partial output, so restarting on another provider would splice two different answers together. A failure past that point ends the stream with a final `data: {"error":{"message":"..."}}` event instead.
+
+| Situation | Client sees |
+|:---|:---|
+| Upstream fails before any output | Ordinary JSON error with a real status (`502`, `503`), because headers are sent lazily on the first event |
+| Upstream fails mid-stream | The fragments so far, then an `error` event |
+| Client disconnects mid-stream | Upstream call is cancelled; not counted against the provider's breaker |
+| Prompt is already cached | `X-LLMGate-Cache: hit`, the whole reply as one `delta`, then `done` |
+
+**Caching and streams.** The cache key ignores `stream`, so a finished stream fills the cache and a later identical request, streamed or not, skips the provider (`TestStreamingProxiesDeltasThenServesFromCache`). Streams are not coalesced: each client wants its own live tokens.
+
+Measured live against `qwen3:4b`: fragments arrived about 20 ms apart through the gateway, the `done` event carried exact token counts, and the repeat request was a cache hit with no model call. Responses also set `X-Accel-Buffering: no` so nginx-style proxies don't hold tokens back.
+
+---
+
+### `internal/ratelimit` — Per-Key Token Bucket
+
+`rate_limit_rpm: 60` with `rate_limit_burst: 10` lets each key make 10 requests at once, then one per second on average. The bucket key is the API key, or the client IP when the gateway runs without keys. The limiter runs **after** auth, so junk requests with a bad key can't drain a real key's budget.
+
+| Response header | Meaning |
+|:---|:---|
+| `X-RateLimit-Limit` | Bucket size (burst) |
+| `X-RateLimit-Remaining` | Tokens left after this request |
+| `Retry-After` | On `429`: seconds until one token refills |
+
+Each active key costs one small struct, with no background goroutine. Refill is computed lazily from the time since the last request; once the table passes 10,000 keys, buckets that have refilled completely are dropped, which changes nothing for those keys. Rejections are counted in `llmgate_rate_limited_total`.
 
 ---
 
@@ -348,17 +427,20 @@ Roadmap: replace heuristics with a classifier model invoked through the gateway 
 
 #### PII Redaction
 
-Six regex patterns match PII in `content` strings of all message roles. Replacement is done in-place on the `req.Messages` slice before any network egress:
+Five regex patterns match PII in `content` strings of all message roles. Replacement is done in-place on the `req.Messages` slice before any network egress. The patterns run in a **fixed order**:
 
 ```go
-var piiPatterns = map[string]*regexp.Regexp{
-    "EMAIL":     regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`),
-    "CARD":      regexp.MustCompile(`\b(?:\d[ -]*?){13,16}\b`),
-    "SSN":       regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`),
-    "IP":        regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`),
-    "PHONE_IND": regexp.MustCompile(`\b(?:\+91[\-\s]?)?[6-9]\d{9}\b`),
+var piiPatterns = []struct {
+    label string
+    re    *regexp.Regexp
+}{
+    {"EMAIL", ...}, {"CARD", ...}, {"SSN", ...}, {"IP", ...}, {"PHONE_IND", ...},
 }
 ```
+
+The order matters because the patterns overlap: a 16-digit card number contains a valid 10-digit Indian mobile number. An earlier version kept them in a Go map, whose iteration order is random, so the same prompt could redact differently from one request to the next. That also gave it a different cache key each time. `TestRedactionIsDeterministic` pins this down.
+
+**Output redaction.** With `redact_output: true` the same patterns also scrub the model's reply before it is returned and cached, for when a model echoes or invents personal data. It applies to non-streamed replies and to the cached copy of a stream; live stream fragments are passed through as they arrive, because a pattern can span two fragments.
 
 Replacement token format: `[REDACTED_<LABEL>]` — parseable by downstream log analysis pipelines. `Result.Redactions` counts the total number of spans replaced across all messages in a single call.
 
@@ -587,7 +669,10 @@ providers:
     base_url: https://api.openai.com
     api_key: ${OPENAI_API_KEY}
     model: gpt-4o-mini
-  - name: ollama              # fallback; no api_key needed
+  - name: anthropic           # second
+    api_key: ${ANTHROPIC_API_KEY}
+    model: claude-haiku-5-5
+  - name: ollama              # local fallback; no api_key needed
     base_url: http://localhost:11434
     model: llama3.2
 
@@ -604,11 +689,15 @@ cache_ttl_s: 300              # 0 disables caching and coalescing
 
 block_prompt_injection: true  # 403 on heuristic injection patterns
 redact_pii: true              # in-place regex redaction before provider
+redact_output: false          # also scrub PII from replies
+
+rate_limit_rpm: 0             # per key (or client IP); 0 = off
+rate_limit_burst: 0           # 0 = same as rate_limit_rpm
 
 api_keys: ""                  # comma-separated; empty = open (local dev only)
 
+# redis: localhost:6379       # share the cache across replicas
 # database: postgres://llmgate:llmgate@localhost:5432/llmgate?sslmode=disable
-# redis: localhost:6379
 ```
 
 **Environment overrides** (useful for container deployments):
@@ -618,6 +707,7 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 | `LLMGATE_ADDR` | `addr` |
 | `LLMGATE_UPSTREAM_TIMEOUT_S` | `upstream_timeout_s` |
 | `LLMGATE_API_KEYS` | `api_keys` (comma-separated) |
+| `LLMGATE_RATE_LIMIT_RPM` | `rate_limit_rpm` |
 | `DATABASE_URL` | `database` |
 | `REDIS_ADDR` | `redis` |
 | `OPENAI_API_KEY` | expanded inside provider `api_key: ${OPENAI_API_KEY}` |
@@ -659,6 +749,7 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 | `max_tokens` | int | | OpenAI: `max_tokens`, Ollama: `options.num_predict` |
 | `response_format` | object | | `{"type":"json_object"}` → Ollama: `format:"json"` |
 | `think` | bool | | Ollama-only reasoning toggle; `nil` = omitted from payload |
+| `stream` | bool | | Reply as server-sent events (see [Streaming](#streaming-sse)) |
 
 ### Response
 
@@ -675,9 +766,9 @@ api_keys: ""                  # comma-separated; empty = open (local dev only)
 }
 ```
 
-**Response headers:** `X-LLMGate-Cache: hit | miss | coalesced | bypass`, `Content-Type: application/json`, and `Retry-After` on `503`.
+**Response headers:** `X-LLMGate-Cache: hit | miss | coalesced | bypass`, `Content-Type: application/json` (or `text/event-stream` when streaming), `X-RateLimit-Limit` / `X-RateLimit-Remaining` when rate limiting is on, and `Retry-After` on `429` and `503`.
 
-**Status codes:** `400` bad JSON or no messages · `401` bad API key · `403` blocked by guardrails · `413` body over 1 MiB · `502` all providers failed · `503` every provider's breaker is open.
+**Status codes:** `400` bad JSON or no messages · `401` bad API key · `403` blocked by guardrails · `413` body over 1 MiB · `429` rate limit · `502` all providers failed · `503` every provider's breaker is open.
 
 ### Metrics (`GET /metrics`)
 
@@ -690,7 +781,10 @@ Hand-rolled Prometheus text format (no `client_golang` dependency):
 | `llmgate_cost_usd_total` | counter | Estimated spend in USD |
 | `llmgate_cache_hits_total` / `_misses_total` | counter | Cache lookups |
 | `llmgate_cache_evictions_total` | counter | Entries dropped to stay under the bound |
-| `llmgate_cache_entries` | gauge | Entries currently cached |
+| `llmgate_cache_entries` | gauge | Entries in the local cache tier |
+| `llmgate_cache_remote_hits_total` | counter | Local misses answered by Redis |
+| `llmgate_cache_remote_errors_total` | counter | Redis calls that failed open |
+| `llmgate_rate_limited_total` | counter | Requests rejected with `429` |
 | `llmgate_coalesced_total` | counter | Requests that shared an in-flight upstream call |
 | `llmgate_upstream_flights_total` | counter | Coalescing groups that made an upstream call |
 | `llmgate_provider_calls_total{provider}` | counter | Calls per provider |
@@ -799,10 +893,14 @@ internal/
   providers/      provider.go — Provider interface, Request/Response types, Build()
                   openai.go — OpenAI adapter (POST /v1/chat/completions)
                   ollama.go — Ollama adapter (POST /api/chat, format translation)
+                  anthropic.go — Anthropic adapter (POST /v1/messages)
+                  stream.go — Streamer interface, SSE/NDJSON scanners, per-provider streams
   router/         router.go — failover, error-aware retry, jittered backoff, circuit breaker
   flight/         flight.go — coalescing of identical in-flight requests
   guardrails/     guardrails.go — injection scanner + PII redactor
-  cache/          cache.go — SHA-256 keyed bounded LRU with TTL + NewRedis seam
+  cache/          cache.go — SHA-256 keyed bounded LRU with TTL
+                  redis.go — Redis tier over a built-in RESP client, fails open
+  ratelimit/      ratelimit.go — per-key token bucket
   metering/       metering.go — Meter interface, memMeter, Cost(), NewPostgres seam
   eval/           eval.go — Run(), LoadCases(), Report, ChatFunc type
                   eval_test.go — TestGoldenSet CI quality gate + stubChat
@@ -823,10 +921,14 @@ Makefile          Developer workflow targets
 
 | Status | Item | Seam in code |
 |:---:|:---|:---|
-| ✅ | OpenAI & Ollama provider adapters | `internal/providers/` |
+| ✅ | OpenAI, Ollama & Anthropic provider adapters | `internal/providers/` |
+| ✅ | SSE streaming from all providers, failover up to the first byte | `internal/providers/stream.go`, `RouteStream` |
 | ✅ | Ordered failover, error-aware retry, jittered exponential backoff | `internal/router/router.go` |
 | ✅ | Per-provider circuit breaker with half-open trial | `internal/router/router.go` |
 | ✅ | SHA-256 content-addressed, bounded LRU cache | `internal/cache/cache.go` |
+| ✅ | Redis cache tier (zero-dependency RESP client, fails open) | `internal/cache/redis.go` |
+| ✅ | Per-key rate limiting (token bucket, `429`) | `internal/ratelimit/` |
+| ✅ | Output-side PII redaction | `guardrails.RedactOutput` |
 | ✅ | Coalescing of identical in-flight requests | `internal/flight/flight.go` |
 | ✅ | Heuristic prompt-injection scanner (403) | `internal/guardrails/guardrails.go` |
 | ✅ | In-place PII redaction (5 entity types) | `internal/guardrails/guardrails.go` |
@@ -835,14 +937,11 @@ Makefile          Developer workflow targets
 | ✅ | Golden-set CI eval gate | `internal/eval/` + `.github/workflows/eval.yml` |
 | ✅ | Distroless Docker container | `Dockerfile` |
 | ⬜ | Cache only deterministic requests by default (`temperature: 0`) | `handleChat` cache policy |
-| ⬜ | SSE streaming passthrough | `handleChat` → `http.Flusher` |
 | ⬜ | PostgreSQL metering backend | `metering.NewPostgres` stub exists |
-| ⬜ | Redis cache backend | `cache.NewRedis` stub exists |
 | ⬜ | Semantic / embedding cache | needs embedding provider |
-| ⬜ | Anthropic & Gemini adapters | add cases in `providers.Build()` |
+| ⬜ | Gemini adapter | add a case in `providers.Build()` |
+| ⬜ | Output-side injection / policy scanning | post-router stage in `handleChat` |
 | ⬜ | Classifier-based injection detector | replace heuristic in `guardrails.go` |
-| ⬜ | Per-key rate limiting | middleware layer in `server.go` |
-| ⬜ | Output-side safety scanning | post-router stage in `handleChat` |
 
 ---
 

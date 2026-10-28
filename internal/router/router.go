@@ -74,6 +74,52 @@ func New(chain []providers.Provider, retry config.Retry) *Router {
 // retryable errors, and moves on immediately when the error says the request
 // itself was rejected. It returns the first success, or a joined error.
 func (r *Router) Route(ctx context.Context, req providers.Request) (*providers.Response, error) {
+	return r.run(ctx, func(p providers.Provider) (*providers.Response, error) {
+		return p.Chat(ctx, req)
+	}, nil)
+}
+
+// RouteStream is Route for streamed replies. onDelta receives text as it
+// arrives. Retry and failover work as in Route until the first fragment has
+// been delivered; after that the client has partial output, so a failure ends
+// the stream instead of silently restarting it on another provider.
+// Providers that cannot stream are called normally and delivered in one piece.
+func (r *Router) RouteStream(ctx context.Context, req providers.Request, onDelta func(string) error) (*providers.Response, error) {
+	started := false
+	deliver := func(d string) error {
+		started = true
+		if err := onDelta(d); err != nil {
+			return &clientError{err}
+		}
+		return nil
+	}
+	return r.run(ctx, func(p providers.Provider) (*providers.Response, error) {
+		if s, ok := p.(providers.Streamer); ok {
+			return s.ChatStream(ctx, req, deliver)
+		}
+		resp, err := p.Chat(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Content != "" {
+			if err := deliver(resp.Content); err != nil {
+				return nil, err
+			}
+		}
+		return resp, nil
+	}, func() bool { return started })
+}
+
+// clientError marks a failure to deliver output to the caller (for example a
+// closed connection). It is the caller's problem, not the provider's.
+type clientError struct{ err error }
+
+func (e *clientError) Error() string { return "client: " + e.err.Error() }
+func (e *clientError) Unwrap() error { return e.err }
+
+// run is the shared failover loop. committed, when set, reports whether output
+// has already reached the client, which forbids any further attempt.
+func (r *Router) run(ctx context.Context, call func(providers.Provider) (*providers.Response, error), committed func() bool) (*providers.Response, error) {
 	var errs []error
 	tried := false
 	for _, m := range r.chain {
@@ -90,19 +136,27 @@ func (r *Router) Route(ctx context.Context, req providers.Request) (*providers.R
 				return nil, err
 			}
 			start := r.now()
-			resp, err := m.p.Chat(ctx, req)
-			// A caller that hung up or ran out of time says nothing about the
-			// provider's health, so it is recorded but not held against it.
-			callerGone := ctx.Err() != nil
+			resp, err := call(m.p)
+			// A caller that hung up, ran out of time or stopped reading says
+			// nothing about the provider's health, so it is recorded but not
+			// held against it.
+			var ce *clientError
+			callerGone := ctx.Err() != nil || errors.As(err, &ce)
 			r.record(m, r.now().Sub(start), err, callerGone)
 			if err == nil {
 				return resp, nil
 			}
 			if callerGone {
-				return nil, ctx.Err()
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return nil, err
 			}
 			errs = append(errs, fmt.Errorf("%s attempt %d: %w", m.p.Name(), attempt, err))
 			slog.Warn("provider call failed", "provider", m.p.Name(), "attempt", attempt, "err", err)
+			if committed != nil && committed() {
+				return nil, fmt.Errorf("stream interrupted: %w", err)
+			}
 			if !providers.Retryable(err) || attempt == r.retry.MaxAttempts {
 				break
 			}

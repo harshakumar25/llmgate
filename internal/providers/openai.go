@@ -1,11 +1,9 @@
 package providers
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 
 	"github.com/harshakumar25/llmgate/internal/config"
@@ -30,47 +28,38 @@ func NewOpenAI(c config.Provider, client *http.Client) *OpenAI {
 
 func (o *OpenAI) Name() string { return "openai" }
 
-func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
+// payload builds the /chat/completions body shared by Chat and ChatStream.
+func (o *OpenAI) payload(req Request) (string, map[string]any) {
 	model := req.Model
 	if model == "" {
 		model = o.model
 	}
-	payload := map[string]any{
+	p := map[string]any{
 		"model":       model,
 		"messages":    req.Messages,
 		"temperature": req.Temperature,
 	}
 	// OpenAI rejects max_tokens: 0, so only send it when set.
 	if req.MaxTokens > 0 {
-		payload["max_tokens"] = req.MaxTokens
+		p["max_tokens"] = req.MaxTokens
 	}
 	if req.ResponseFormat != nil {
-		payload["response_format"] = req.ResponseFormat
+		p["response_format"] = req.ResponseFormat
 	}
-	body, err := json.Marshal(payload)
+	return model, p
+}
+
+func (o *OpenAI) post(ctx context.Context, payload map[string]any) (*http.Response, error) {
+	return postJSON(ctx, o.client, o.Name(), o.baseURL+"/v1/chat/completions", o.apiKey, payload)
+}
+
+func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
+	model, payload := o.payload(req)
+	resp, err := o.post(ctx, payload)
 	if err != nil {
 		return nil, err
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/v1/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if o.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+o.apiKey)
-	}
-
-	resp, err := o.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("openai: request: %w", err)
 	}
 	defer resp.Body.Close()
-
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &StatusError{Provider: "openai", Code: resp.StatusCode, Body: truncate(data, 300)}
-	}
 
 	var parsed struct {
 		Choices []struct {
@@ -79,10 +68,9 @@ func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return nil, fmt.Errorf("openai: decode: %w", err)
 	}
 	if len(parsed.Choices) == 0 {
@@ -93,11 +81,7 @@ func (o *OpenAI) Chat(ctx context.Context, req Request) (*Response, error) {
 		Content:  parsed.Choices[0].Message.Content,
 		Model:    model,
 		Provider: o.Name(),
-		Usage: Usage{
-			PromptTokens:     parsed.Usage.PromptTokens,
-			CompletionTokens: parsed.Usage.CompletionTokens,
-			TotalTokens:      parsed.Usage.TotalTokens,
-		},
+		Usage:    usage(parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens),
 	}, nil
 }
 

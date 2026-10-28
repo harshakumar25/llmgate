@@ -16,6 +16,7 @@ import (
 type Guardrails struct {
 	blockInjection bool
 	redactPII      bool
+	redactOutput   bool
 }
 
 // Result reports what the guardrails decided.
@@ -30,7 +31,7 @@ type Result struct {
 
 // New builds Guardrails from config.
 func New(cfg config.Guardrails) *Guardrails {
-	return &Guardrails{blockInjection: cfg.BlockPromptInjection, redactPII: cfg.RedactPII}
+	return &Guardrails{blockInjection: cfg.BlockPromptInjection, redactPII: cfg.RedactPII, redactOutput: cfg.RedactOutput}
 }
 
 // injectionPatterns are coarse signals of a prompt-injection attempt. A real
@@ -43,12 +44,19 @@ var injectionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)print (your|the) (system|initial) prompt`),
 }
 
-var piiPatterns = map[string]*regexp.Regexp{
-	"EMAIL":     regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`),
-	"CARD":      regexp.MustCompile(`\b(?:\d[ -]*?){13,16}\b`),
-	"SSN":       regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`),
-	"IP":        regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`),
-	"PHONE_IND": regexp.MustCompile(`\b(?:\+91[\-\s]?)?[6-9]\d{9}\b`),
+// piiPatterns run in this fixed order. The order matters: patterns overlap
+// (a 16-digit card contains a valid 10-digit phone number), and a map's random
+// iteration order made the same prompt redact differently between requests,
+// which also gave it a different cache key each time.
+var piiPatterns = []struct {
+	label string
+	re    *regexp.Regexp
+}{
+	{"EMAIL", regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)},
+	{"CARD", regexp.MustCompile(`\b(?:\d[ -]*?){13,16}\b`)},
+	{"SSN", regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)},
+	{"IP", regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)},
+	{"PHONE_IND", regexp.MustCompile(`\b(?:\+91[\-\s]?)?[6-9]\d{9}\b`)},
 }
 
 // Apply scans and, where configured, mutates req in place. When a request is
@@ -86,12 +94,21 @@ func matchInjection(s string) string {
 	return ""
 }
 
+// RedactOutput scrubs PII from a model's reply when output redaction is on.
+// It returns the text unchanged and 0 when it is off.
+func (g *Guardrails) RedactOutput(s string) (string, int) {
+	if !g.redactOutput {
+		return s, 0
+	}
+	return redact(s)
+}
+
 func redact(s string) (string, int) {
 	count := 0
-	for label, p := range piiPatterns {
-		s = p.ReplaceAllStringFunc(s, func(string) string {
+	for _, p := range piiPatterns {
+		s = p.re.ReplaceAllStringFunc(s, func(string) string {
 			count++
-			return "[REDACTED_" + label + "]"
+			return "[REDACTED_" + p.label + "]"
 		})
 	}
 	return s, count

@@ -31,6 +31,10 @@ type Request struct {
 	// Think toggles reasoning on models that support it (Ollama's "think").
 	// Nil leaves the model's default; providers without the knob ignore it.
 	Think *bool `json:"think,omitempty"`
+	// Stream asks the gateway to send the reply as server-sent events. It is
+	// a transport choice, not part of the prompt, so it never changes the
+	// cache key (see cache.Key).
+	Stream bool `json:"stream,omitempty"`
 }
 
 // ResponseFormat is OpenAI's response_format field.
@@ -103,6 +107,8 @@ func Build(cfgs []config.Provider, timeout time.Duration) ([]Provider, error) {
 			out = append(out, NewOpenAI(c, httpClient))
 		case "ollama":
 			out = append(out, NewOllama(c, httpClient))
+		case "anthropic":
+			out = append(out, NewAnthropic(c, httpClient))
 		default:
 			return nil, fmt.Errorf("providers: unknown provider %q", c.Name)
 		}
